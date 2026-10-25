@@ -37,6 +37,7 @@ class SearchHitOut(BaseModel):
     score: float
     vector_rank: int | None
     lexical_rank: int | None
+    phonetic_rank: int | None
 
 
 class SearchOut(BaseModel):
@@ -70,7 +71,49 @@ class ChatIn(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
 
 
-class ChatOut(BaseModel):
+class BaselineChatOut(BaseModel):
     intent: str
     answer: str
     sources: list[SearchHitOut] = []
+
+
+class SourceOut(BaseModel):
+    n: int
+    chunk_id: str
+    document_title: str
+    content: str
+
+
+class ToolCallOut(BaseModel):
+    name: str
+    input: dict
+    is_error: bool
+
+
+class ChatOut(BaseModel):
+    answer: str
+    language: str
+    model: str
+    stop_reason: str | None
+    tool_calls: list[ToolCallOut]
+    sources: list[SourceOut]
+    usage: dict[str, int]
+    took_ms: float
+
+
+class MemoryOut(BaseModel):
+    customer_ref: str
+    messages: list[dict]
+
+
+class TranscriptOut(BaseModel):
+    text: str
+    language: str
+    language_probability: float
+    duration_s: float
+    took_ms: float
+
+
+class VoiceChatOut(BaseModel):
+    transcript: TranscriptOut
+    reply: ChatOut

@@ -1,7 +1,11 @@
-"""Hybrid retrieval: Postgres full-text search + pgvector, fused with Reciprocal Rank Fusion.
+"""Hybrid retrieval: pgvector + two Postgres full-text indexes, fused with Reciprocal Rank Fusion.
 
-Both retrievers run in one SQL statement. RRF only uses ranks, so the two very different score
-scales (ts_rank_cd vs cosine distance) never need to be calibrated against each other:
+Three retrievers run in one SQL statement:
+  vector    - multilingual embeddings (meaning, across languages and scripts)
+  lexical   - exact normalised words (names, numbers, product terms)
+  phonetic  - phonetic keys, so Hinglish spellings and Devanagari match ("khatam" ~ "खत्म")
+
+RRF only uses ranks, so the different score scales never need to be calibrated against each other:
 
     score(chunk) = sum over retrievers r of 1 / (rrf_k + rank_r(chunk))
 """
@@ -18,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.services.embeddings import embed_query
-from app.services.text import to_or_tsquery
+from app.services.text import to_or_tsquery, to_phonetic_tsquery
 
 SearchMode = Literal["hybrid", "vector", "lexical"]
 
@@ -34,6 +38,7 @@ class SearchHit:
     score: float
     vector_rank: int | None
     lexical_rank: int | None
+    phonetic_rank: int | None
 
 
 @dataclass
@@ -43,9 +48,9 @@ class SearchResult:
     took_ms: float
 
 
-# :tsquery is NULL when the query is only stopwords; to_tsquery(NULL) matches nothing, so the
-# result degrades to pure vector search. Candidates are fetched per retriever, fused, then cut to
-# :top_k. FULL OUTER JOIN keeps chunks that only one retriever found.
+# A NULL tsquery (query made only of stopwords) matches nothing, so that retriever contributes no
+# rows. Each retriever returns up to :candidates rows; UNION ALL + GROUP BY fuses them, keeping
+# chunks that only one retriever found, then the top :top_k are returned.
 _HYBRID_SQL = text(
     """
     WITH vec AS (
@@ -70,15 +75,32 @@ _HYBRID_SQL = text(
             LIMIT :candidates
         ) l
     ),
+    pho AS (
+        SELECT id, row_number() OVER (ORDER BY rank DESC) AS rnk
+        FROM (
+            SELECT id, ts_rank_cd(tsv_phonetic, q, 1) AS rank
+            FROM chunks, to_tsquery('simple', :phonetic_tsquery) AS q
+            WHERE tenant_id = :tenant_id AND :use_lexical AND tsv_phonetic @@ q
+            ORDER BY rank DESC
+            LIMIT :candidates
+        ) p
+    ),
+    ranked AS (
+        SELECT id, rnk, 'vector' AS src FROM vec
+        UNION ALL SELECT id, rnk, 'lexical' FROM lex
+        UNION ALL SELECT id, rnk, 'phonetic' FROM pho
+    ),
     fused AS (
-        SELECT COALESCE(vec.id, lex.id) AS id,
-               vec.rnk AS vector_rank,
-               lex.rnk AS lexical_rank,
-               COALESCE(1.0 / (:rrf_k + vec.rnk), 0) + COALESCE(1.0 / (:rrf_k + lex.rnk), 0) AS score
-        FROM vec FULL OUTER JOIN lex ON vec.id = lex.id
+        SELECT id,
+               MIN(rnk) FILTER (WHERE src = 'vector') AS vector_rank,
+               MIN(rnk) FILTER (WHERE src = 'lexical') AS lexical_rank,
+               MIN(rnk) FILTER (WHERE src = 'phonetic') AS phonetic_rank,
+               SUM(1.0 / (:rrf_k + rnk)) AS score
+        FROM ranked
+        GROUP BY id
     )
     SELECT c.id, c.document_id, d.title, c.chunk_index, c.content, c.metadata,
-           f.score, f.vector_rank, f.lexical_rank
+           f.score, f.vector_rank, f.lexical_rank, f.phonetic_rank
     FROM fused f
     JOIN chunks c ON c.id = f.id
     JOIN documents d ON d.id = c.document_id
@@ -116,6 +138,7 @@ async def hybrid_search(
         {
             "embedding": _vector_literal(embedding),
             "tsquery": to_or_tsquery(query),
+            "phonetic_tsquery": to_phonetic_tsquery(query),
             "tenant_id": tenant_id,
             "use_vector": use_vector,
             "use_lexical": use_lexical,
@@ -135,6 +158,7 @@ async def hybrid_search(
             score=float(r.score),
             vector_rank=r.vector_rank,
             lexical_rank=r.lexical_rank,
+            phonetic_rank=r.phonetic_rank,
         )
         for r in rows
     ]

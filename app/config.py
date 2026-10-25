@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -39,6 +40,27 @@ class Settings(BaseSettings):
 
     max_upload_mb: int = 20
     default_tenant: str = "demo-bank"
+
+    # LLM agent. The SDKs read ANTHROPIC_API_KEY / GEMINI_API_KEY from the environment themselves.
+    llm_provider: Literal["claude", "gemini"] = "claude"
+    llm_model: str = "claude-haiku-5-5"  # used when llm_provider = claude
+    llm_effort: str = "low"  # Claude only: low | medium | high; low keeps chat latency down
+    gemini_model: str = "gemini-2.5-flash"  # used when llm_provider = gemini
+    llm_max_tokens: int = 8000
+    llm_timeout_seconds: float = 60.0
+    llm_max_retries: int = 2
+    agent_max_tool_rounds: int = 6
+
+    # Conversation memory (Redis)
+    memory_max_messages: int = 20  # user + assistant messages kept per customer
+    memory_ttl_seconds: int = 24 * 3600
+    redemption_confirm_ttl_seconds: int = 600
+
+    # Voice (local faster-whisper; the model is baked into the Docker image)
+    voice_enabled: bool = True
+    whisper_model: str = "small"
+    whisper_compute_type: str = "int8"
+    max_audio_mb: int = 10
 
 
 @lru_cache

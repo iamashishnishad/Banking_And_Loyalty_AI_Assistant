@@ -10,15 +10,21 @@ WORKDIR /app
 # CPU-only torch first: the default Linux wheel pulls ~4 GB of CUDA libraries we don't use.
 RUN pip install --index-url https://download.pytorch.org/whl/cpu torch
 
-COPY requirements.txt .
-RUN pip install -r requirements.txt
+COPY requirements-ml.txt .
+RUN pip install -r requirements-ml.txt
 
-# Bake the embedding model into the image so containers start without a network download.
+# Bake the embedding and speech models into the image so containers start without a network download.
 ARG EMBEDDING_MODEL=intfloat/multilingual-e5-small
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('${EMBEDDING_MODEL}')"
-# The model is local now; stop the Hugging Face client from calling the Hub on every start.
+ARG WHISPER_MODEL=small
+RUN python -c "from faster_whisper import WhisperModel; WhisperModel('${WHISPER_MODEL}', device='cpu', compute_type='int8')"
+
+# The models are local now; stop the Hugging Face client from calling the Hub on every start.
 ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
 
 COPY alembic.ini .
 COPY alembic ./alembic

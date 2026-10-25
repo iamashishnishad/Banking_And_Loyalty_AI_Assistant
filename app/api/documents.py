@@ -18,8 +18,9 @@ async def upload_document(
     session: SessionDep,
     tenant_id: TenantDep,
     file: UploadFile = File(...),
-    title: str | None = Form(default=None),
+    title: str | None = Form(default=None, description="Optional; defaults to the Markdown heading or filename"),
 ) -> IngestOut:
+    title = title.strip() if title else None
     max_bytes = get_settings().max_upload_mb * 1024 * 1024
     data = await file.read(max_bytes + 1)
     if len(data) > max_bytes:

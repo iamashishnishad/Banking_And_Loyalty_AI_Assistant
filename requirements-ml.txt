@@ -1,0 +1,5 @@
+# Heavy ML dependencies, installed in their own Docker layer before the models are baked in,
+# so editing requirements.txt doesn't trigger a multi-minute model re-download.
+sentence-transformers>=3.0
+faster-whisper>=1.2
+av>=15,<19  # faster-whisper 1.2 passes metadata_errors=, which PyAV 19 removed

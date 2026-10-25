@@ -8,6 +8,8 @@ normalisation therefore happen here, and the exact same function runs on documen
 import re
 import unicodedata
 
+from app.services.language import phonetic_key
+
 # Letters/digits (no underscore) plus the whole Devanagari block: \w alone misses vowel signs and
 # viramas (category M), which would split words like "पॉइंट्स" into fragments.
 _DEVANAGARI = f"{chr(0x0900)}-{chr(0x0963)}{chr(0x0966)}-{chr(0x097F)}"  # U+0900-097F minus danda । ॥
@@ -101,3 +103,15 @@ def to_or_tsquery(text: str) -> str | None:
     if not terms:
         return None
     return " | ".join(terms)
+
+
+def phonetic_text(text: str) -> str:
+    """Space-joined phonetic keys (see language.phonetic_key) for chunks.phonetic_text. Lets
+    'khatam', 'khatm' and 'खत्म' match each other. Pure numbers are left to the lexical index."""
+    keys = (phonetic_key(t) for t in tokenize(text) if not t.isdigit())
+    return " ".join(k for k in keys if k)
+
+
+def to_phonetic_tsquery(text: str) -> str | None:
+    keys = list(dict.fromkeys(phonetic_text(text).split()))
+    return " | ".join(keys) if keys else None

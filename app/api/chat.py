@@ -1,76 +1,84 @@
-"""Baseline /chat: keyword intent routing + extractive answers from hybrid search.
+"""LLM agent chat: JSON (/chat) and Server-Sent Events (/chat/stream), plus memory endpoints."""
 
-This is deliberately the POC behaviour. Phase 2 replaces the routing with LLM tool calling and
-the extractive answer with a generated, cited one; keeping the baseline lets the eval suite
-measure how much that improves things.
-"""
-
-import re
-from dataclasses import asdict
+import json
+import uuid
+from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import StreamingResponse
+from redis.asyncio import Redis
+from sqlalchemy import select
 
+from app.agent.llm import get_llm
+from app.agent.runner import AgentEvent
+from app.agent.service import chat_turn
 from app.api.deps import RedisDep, SessionDep, TenantDep
-from app.schemas import ChatIn, ChatOut, SearchHitOut
-from app.services.loyalty import CustomerNotFoundError, get_balance
-from app.services.search import hybrid_search
-from app.services.text import tokenize
+from app.models import Customer
+from app.schemas import ChatIn, ChatOut, MemoryOut
+from app.services.memory import ConversationMemory
 
-router = APIRouter(tags=["chat"])
-
-_BALANCE_TERMS = {"balance", "kitne", "kitna", "कितने", "बैलेंस"}
-_POINTS_TERMS = {"points", "rewards"}
-_DEVANAGARI_RE = re.compile(f"[{chr(0x0900)}-{chr(0x097F)}]")
-_HINGLISH_MARKERS = {"kya", "hai", "mere", "mera", "kitne", "kaise", "kab", "nahi", "batao", "kar", "ka", "ki", "ke"}
+router = APIRouter(prefix="/chat", tags=["chat"])
 
 
-def detect_language(message: str) -> str:
-    if _DEVANAGARI_RE.search(message):
-        return "hindi"
-    words = set(re.findall(r"[a-z]+", message.lower()))
-    return "hinglish" if words & _HINGLISH_MARKERS else "english"
-
-
-_BALANCE_REPLY = {
-    "english": "{name}, you have {points} points.{expiring}",
-    "hinglish": "{name}, aapke paas {points} points hain.{expiring}",
-    "hindi": "{name}, आपके पास {points} पॉइंट्स हैं।{expiring}",
-}
-_EXPIRING_REPLY = {
-    "english": " {n} points expire in the next 30 days.",
-    "hinglish": " {n} points agle 30 din mein expire honge.",
-    "hindi": " {n} पॉइंट्स अगले 30 दिनों में समाप्त होंगे।",
-}
-_NO_ANSWER = {
-    "english": "Sorry, I couldn't find that in the bank's documents.",
-    "hinglish": "Maaf kijiye, yeh jaankari bank ke documents mein nahi mili.",
-    "hindi": "क्षमा करें, यह जानकारी बैंक के दस्तावेज़ों में नहीं मिली।",
-}
-
-
-@router.post("/chat", response_model=ChatOut)
-async def chat(body: ChatIn, session: SessionDep, tenant_id: TenantDep, redis: RedisDep) -> ChatOut:
-    lang = detect_language(body.message)
-    lowered = body.message.lower()
-    # Balance terms like "kitne" are stopwords for search, so match them on the raw text.
-    asks_balance = any(term in lowered for term in _BALANCE_TERMS)
-
-    if asks_balance and set(tokenize(body.message)) & _POINTS_TERMS:
-        try:
-            balance = await get_balance(session, tenant_id, body.customer_ref)
-        except CustomerNotFoundError as exc:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Customer not found") from exc
-        expiring = (
-            _EXPIRING_REPLY[lang].format(n=balance.expiring_within_30_days) if balance.expiring_within_30_days else ""
-        )
-        answer = _BALANCE_REPLY[lang].format(name=balance.customer_name, points=balance.points, expiring=expiring)
-        return ChatOut(intent="points_balance", answer=answer)
-
-    result = await hybrid_search(session, tenant_id, body.message, top_k=3, redis=redis)
-    if not result.hits:
-        return ChatOut(intent="faq", answer=_NO_ANSWER[lang])
-    return ChatOut(
-        intent="faq",
-        answer=result.hits[0].content,
-        sources=[SearchHitOut(**asdict(h)) for h in result.hits],
+async def ensure_customer(session, tenant_id: uuid.UUID, customer_ref: str) -> None:
+    """Checked up front: once a stream has started, a 404 can no longer be sent."""
+    exists = await session.scalar(
+        select(Customer.id).where(Customer.tenant_id == tenant_id, Customer.external_ref == customer_ref)
     )
+    if exists is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Customer not found")
+
+
+async def run_chat(redis: Redis, tenant_id: uuid.UUID, customer_ref: str, message: str) -> ChatOut:
+    """Run a full turn without streaming and return the final result."""
+    llm = get_llm()
+    async for event in chat_turn(llm=llm, redis=redis, tenant_id=tenant_id, customer_ref=customer_ref, message=message):
+        if event.type == "error":
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, event.data["message"])
+        if event.type == "done":
+            return ChatOut(**event.data)
+    raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Agent finished without an answer")
+
+
+@router.post("", response_model=ChatOut)
+async def chat(body: ChatIn, session: SessionDep, tenant_id: TenantDep, redis: RedisDep) -> ChatOut:
+    await ensure_customer(session, tenant_id, body.customer_ref)
+    return await run_chat(redis, tenant_id, body.customer_ref, body.message)
+
+
+def _sse(event: AgentEvent) -> str:
+    return f"event: {event.type}\ndata: {json.dumps(event.data, ensure_ascii=False, default=str)}\n\n"
+
+
+@router.post(
+    "/stream",
+    response_class=StreamingResponse,
+    responses={200: {"content": {"text/event-stream": {}}, "description": "meta, token, tool_call, tool_result, done | error"}},
+)
+async def chat_stream(body: ChatIn, session: SessionDep, tenant_id: TenantDep, redis: RedisDep) -> StreamingResponse:
+    await ensure_customer(session, tenant_id, body.customer_ref)
+    llm = get_llm()  # raises before the stream starts, so a missing key is a proper 503
+
+    async def frames() -> AsyncIterator[str]:
+        async for event in chat_turn(
+            llm=llm, redis=redis, tenant_id=tenant_id, customer_ref=body.customer_ref, message=body.message
+        ):
+            yield _sse(event)
+
+    return StreamingResponse(
+        frames(),
+        media_type="text/event-stream",
+        # X-Accel-Buffering stops nginx-style proxies from buffering the whole stream.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/memory/{customer_ref}", response_model=MemoryOut)
+async def get_memory(customer_ref: str, tenant_id: TenantDep, redis: RedisDep) -> MemoryOut:
+    messages = await ConversationMemory(redis, tenant_id, customer_ref).history()
+    return MemoryOut(customer_ref=customer_ref, messages=messages)
+
+
+@router.delete("/memory/{customer_ref}", status_code=status.HTTP_204_NO_CONTENT)
+async def clear_memory(customer_ref: str, tenant_id: TenantDep, redis: RedisDep) -> None:
+    await ConversationMemory(redis, tenant_id, customer_ref).clear()
