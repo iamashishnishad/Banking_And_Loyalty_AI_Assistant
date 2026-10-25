@@ -1,0 +1,50 @@
+{
+  "tenants": [
+    {
+      "slug": "demo-bank",
+      "name": "Demo Bank",
+      "customers": [
+        {
+          "external_ref": "CUST1001",
+          "name": "Ravi Sharma",
+          "preferred_language": "hinglish",
+          "ledger": [
+            {"delta": 4200, "reason": "Card spends Jan-Jun", "reference": "seed-1001-earn-1", "expires_in_days": 900},
+            {"delta": 1800, "reason": "Card spends 2023", "reference": "seed-1001-earn-2", "expires_in_days": 20},
+            {"delta": -500, "reason": "Statement credit redemption", "reference": "seed-1001-redeem-1"}
+          ]
+        },
+        {
+          "external_ref": "CUST1002",
+          "name": "Priya Iyer",
+          "preferred_language": "english",
+          "ledger": [
+            {"delta": 12500, "reason": "Signature card welcome bonus", "reference": "seed-1002-earn-1", "expires_in_days": 1000}
+          ]
+        },
+        {
+          "external_ref": "CUST1003",
+          "name": "सुनीता वर्मा",
+          "preferred_language": "hindi",
+          "ledger": [
+            {"delta": 950, "reason": "Card spends", "reference": "seed-1003-earn-1", "expires_in_days": 400}
+          ]
+        }
+      ]
+    },
+    {
+      "slug": "second-bank",
+      "name": "Second Bank",
+      "customers": [
+        {
+          "external_ref": "CUST1001",
+          "name": "Amit Patel",
+          "preferred_language": "english",
+          "ledger": [
+            {"delta": 300, "reason": "Card spends", "reference": "seed-sb-1001-earn-1"}
+          ]
+        }
+      ]
+    }
+  ]
+}

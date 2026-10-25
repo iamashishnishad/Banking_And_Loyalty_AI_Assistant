@@ -1,0 +1,13 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30
+pydantic-settings>=2.3
+python-multipart>=0.0.9
+sqlalchemy[asyncio]>=2.0.30,<2.1
+asyncpg>=0.29
+alembic>=1.13
+pgvector>=0.3
+redis>=5.0
+numpy>=1.26
+sentence-transformers>=3.0
+pypdf>=4.2
+python-docx>=1.1
