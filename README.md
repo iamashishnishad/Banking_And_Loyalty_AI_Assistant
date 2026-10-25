@@ -5,8 +5,8 @@ backend: one bank per tenant, documents and customers isolated per tenant.
 
 **Status: Phases 1–2 complete.**
 - **Phase 1:** hybrid retrieval over Postgres + pgvector, document ingestion, Docker Compose, Alembic, env config.
-- **Phase 2:** a Claude tool-calling agent with Redis conversation memory, Hindi/Hinglish
-  detection and transliteration, voice input via local Whisper, and SSE streaming.
+- **Phase 2:** an LLM tool-calling agent (Gemini or Claude) with Redis conversation memory,
+  Hindi/Hinglish detection and transliteration, voice input via local Whisper, and SSE streaming.
 
 ## Architecture
 
@@ -59,8 +59,17 @@ are the third retriever in RRF. `phonetic_rank` in `/search` results shows when 
 
 ### The agent
 
-[app/agent/](app/agent/) runs a manual tool loop over streamed Claude responses
-(`claude-haiku-5-5` at effort `low` by default). There are four tools:
+[app/agent/](app/agent/) runs a manual tool loop over streamed LLM responses. The provider sits
+behind one interface ([llm.py](app/agent/llm.py)) and is picked with `LLM_PROVIDER`:
+
+| Provider | Default model | Notes |
+| --- | --- | --- |
+| `gemini` | `gemini-2.5-flash` | Free tier works (5 requests/min, and one chat turn is about 2–3 requests). Thought signatures are replayed unchanged within a turn. |
+| `claude` | `claude-haiku-5-5`, effort `low` | Prompt caching on the system prompt and tools |
+
+The loop uses one message format and each adapter converts to and from it. Provider errors become
+`LLMError`, and a rate limit is shown to the customer as "busy, try again in a minute".
+There are four tools:
 
 | Tool | What it does |
 | --- | --- |
@@ -115,7 +124,7 @@ makes each redemption idempotent.
 Requires Docker.
 
 ```bash
-cp .env.example .env               # then set ANTHROPIC_API_KEY for /chat
+cp .env.example .env               # then set GEMINI_API_KEY (or LLM_PROVIDER=claude + ANTHROPIC_API_KEY)
 docker compose up -d --build        # postgres, redis, migrate (one-shot), api
 docker compose exec api python -m scripts.seed          # demo tenants, customers, documents
 docker compose exec api python -m scripts.reindex_text  # (re)build lexical + phonetic text for existing chunks
@@ -143,7 +152,7 @@ curl -s localhost:8000/customers/CUST1001/points
 curl -s localhost:8000/customers/CUST1001/redeem -H 'content-type: application/json' \
   -d '{"points": 500, "reference": "order-123"}'
 
-# Agent chat (needs ANTHROPIC_API_KEY)
+# Agent chat (needs an LLM key)
 curl -s localhost:8000/chat -H 'content-type: application/json' \
   -d '{"customer_ref": "CUST1001", "message": "mere kitne points hai?"}'
 
@@ -202,14 +211,15 @@ The `migrate` service runs `alembic upgrade head` on every `docker compose up`, 
 ```bash
 uv venv --python 3.12 && uv pip install -r requirements-dev.txt
 pytest tests   # unit tests (incl. agent loop with a fake LLM) always run; integration tests need
-               # the stack + seed, and the LLM ones also need ANTHROPIC_API_KEY in the API container
+               # the stack + seed, and the LLM ones also need an LLM key in the API container.
+               # On the Gemini free tier, run the LLM tests one at a time (5 requests/min).
 ```
 
 ## Layout
 
 ```
 app/
-  agent/        LLM wrapper, agent loop, tools, prompts, chat-turn orchestration
+  agent/        LLM providers (Claude, Gemini), agent loop, tools, prompts, chat-turn orchestration
   api/          routers: chat (+stream, memory), chat_baseline, voice, documents, search, loyalty, health
   services/     text + language (detection, transliteration, phonetic keys), parsing, chunking,
                 embeddings, ingestion, search, loyalty, memory, speech
