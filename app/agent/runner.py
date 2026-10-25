@@ -125,7 +125,7 @@ async def run_agent(
             stop_reason = "tool_round_limit"
     except (LLMError, RuntimeError, ValueError) as exc:
         logger.exception("Agent turn failed")
-        if isinstance(exc, LLMError) and "not configured" not in str(exc):
+        if isinstance(exc, LLMError) and not exc.public:
             error_message = "The assistant is temporarily unavailable."  # don't leak provider details
         else:
             error_message = str(exc)

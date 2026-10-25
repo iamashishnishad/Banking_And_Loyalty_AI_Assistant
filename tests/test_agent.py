@@ -134,7 +134,7 @@ def test_provider_error_becomes_error_event(monkeypatch):
 
 
 def test_rejected_key_message_is_passed_through(monkeypatch):
-    events, _ = _run(FakeLLM([LLMError("LLM is not configured: the Gemini API key was rejected.")]), monkeypatch)
+    events, _ = _run(FakeLLM([LLMError("LLM is not configured: the Gemini API key was rejected.", public=True)]), monkeypatch)
     assert "Gemini API key" in events[-1].data["message"]
 
 

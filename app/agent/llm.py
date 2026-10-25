@@ -33,7 +33,15 @@ class FinalMessage:
 
 
 class LLMError(Exception):
-    """Provider failure the agent reports to the client instead of crashing the request."""
+    """Provider failure the agent reports to the client instead of crashing the request.
+    public=True means the message is safe and useful to show the customer as-is."""
+
+    def __init__(self, message: str, public: bool = False) -> None:
+        super().__init__(message)
+        self.public = public
+
+
+_RATE_LIMITED = LLMError("The assistant is busy right now (rate limit reached). Please try again in a minute.", public=True)
 
 
 class LLMNotConfiguredError(RuntimeError):
@@ -77,7 +85,9 @@ class ClaudeLLM:
                         yield TextDelta(event.text)
                 yield FinalMessage(await stream.get_final_message())
         except anthropic.AuthenticationError as exc:
-            raise LLMError("LLM is not configured: the Anthropic API key was rejected.") from exc
+            raise LLMError("LLM is not configured: the Anthropic API key was rejected.", public=True) from exc
+        except anthropic.RateLimitError as exc:
+            raise _RATE_LIMITED from exc
         except anthropic.APIError as exc:
             raise LLMError(f"Claude API error: {type(exc).__name__}") from exc
 
@@ -177,7 +187,9 @@ class GeminiLLM:
                         yield TextDelta(part.text)
         except errors.ClientError as exc:
             if exc.code in (401, 403):
-                raise LLMError("LLM is not configured: the Gemini API key was rejected.") from exc
+                raise LLMError("LLM is not configured: the Gemini API key was rejected.", public=True) from exc
+            if exc.code == 429:  # free tier: 5 requests/min on gemini-2.5-flash
+                raise _RATE_LIMITED from exc
             raise LLMError(f"Gemini API error {exc.code}") from exc
         except errors.ServerError as exc:
             raise LLMError(f"Gemini is unavailable ({exc.code})") from exc
