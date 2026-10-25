@@ -57,6 +57,7 @@ class Chunk(Base):
     __tablename__ = "chunks"
     __table_args__ = (
         Index("ix_chunks_tsv", "tsv", postgresql_using="gin"),
+        Index("ix_chunks_tsv_phonetic", "tsv_phonetic", postgresql_using="gin"),
         Index(
             "ix_chunks_embedding_hnsw",
             "embedding",
@@ -74,6 +75,9 @@ class Chunk(Base):
     # Normalised text (lowercased, stopwords removed) that feeds the full-text index.
     lexical_text: Mapped[str] = mapped_column(Text)
     tsv = mapped_column(TSVECTOR, Computed("to_tsvector('simple', lexical_text)", persisted=True))
+    # Phonetic keys of the same tokens, so Hinglish spelling variants and Devanagari match (0002).
+    phonetic_text: Mapped[str] = mapped_column(Text, default="", server_default="")
+    tsv_phonetic = mapped_column(TSVECTOR, Computed("to_tsvector('simple', phonetic_text)", persisted=True))
     embedding = mapped_column(Vector(EMBEDDING_DIM), nullable=False)
     meta: Mapped[dict] = mapped_column("metadata", JSONB, default=dict, server_default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

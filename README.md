@@ -3,25 +3,29 @@
 A Hindi / Hinglish / English assistant for banking and rewards questions, built as a multi-tenant
 backend: one bank per tenant, documents and customers isolated per tenant.
 
-**Status: Phase 1 (foundation) complete.** Hybrid retrieval over Postgres + pgvector, document
-ingestion, Docker Compose, Alembic migrations, env-based config. Chat is still the keyword-routed,
-extractive baseline; Phase 2 replaces it with an LLM tool-calling agent.
+**Status: Phases 1–2 complete.**
+- **Phase 1:** hybrid retrieval over Postgres + pgvector, document ingestion, Docker Compose, Alembic, env config.
+- **Phase 2:** a Claude tool-calling agent with Redis conversation memory, Hindi/Hinglish
+  detection and transliteration, voice input via local Whisper, and SSE streaming.
 
 ## Architecture
 
 ```
-            ┌──────────────────────── FastAPI (api) ────────────────────────┐
- client ──▶ │ /chat  /search  /documents  /customers/{ref}/points|redeem    │
-            │                                                               │
-            │  ingestion: parse (PDF/DOCX/MD/TXT) → chunk → embed → store   │
-            │  search:    query → normalise ─┬─▶ full-text (tsvector, GIN)  │
-            │                                └─▶ embedding ─▶ pgvector HNSW │
-            │                          RRF fusion of both rankings ◀─┘      │
-            └───────────────┬────────────────────────────────┬──────────────┘
-                            │                                │
-                 Postgres 17 + pgvector 0.8             Redis 7
-                 tenants, documents, chunks,            query-embedding cache
-                 customers, points_ledger
+                     ┌──────────────────────────── FastAPI (api) ─────────────────────────────┐
+ text  ─▶ /chat ─────┤                                                                        │
+ SSE   ◀─ /chat/stream                     ┌─────────────── agent loop ──────────────┐        │
+ audio ─▶ /voice/chat ─▶ Whisper (local) ─▶│ Claude (tool calling, streamed)         │        │
+                     │                     │   ├─ search_knowledge_base ─▶ hybrid    │        │
+                     │  language detect ─▶ │   ├─ get_points_balance                 │        │
+                     │  memory (Redis) ──▶ │   ├─ start_redemption                   │        │
+                     │                     │   └─ confirm_redemption (next turn only)│        │
+                     │                     └─────────────────────────────────────────┘        │
+                     │  hybrid search: vector (HNSW) + lexical (tsvector) + phonetic,  RRF    │
+                     │  ingestion: PDF/DOCX/MD/TXT → chunk → embed → store                    │
+                     └──────────────┬──────────────────────────────────────┬──────────────────┘
+                         Postgres 17 + pgvector 0.8                   Redis 7
+                         tenants, documents, chunks,                  conversation memory, turn counter,
+                         customers, points_ledger                     pending redemptions, query-embedding cache
 ```
 
 ### Hybrid search
@@ -45,6 +49,54 @@ single retriever, which is how the Phase 4 evals compare them.
 > If evals show lexical recall is the bottleneck, the upgrade is ParadeDB `pg_search`, a real
 > BM25 index inside Postgres.
 
+### Phonetic retriever (Hinglish spelling)
+
+Hinglish has no standard spelling: *khatam / khatm / खत्म* and *card / कार्ड* are the same word.
+[language.py](app/services/language.py) romanises Devanagari the way people type (`खत्म → khatm`),
+then reduces every word to a consonant skeleton: aspirates merged, `c/k/q` merged, `z/j` merged,
+vowels dropped (`khatam → ktm`, `कार्ड → krd`). Those keys get their own `tsvector` index and
+are the third retriever in RRF. `phonetic_rank` in `/search` results shows when it contributed.
+
+### The agent
+
+[app/agent/](app/agent/) runs a manual tool loop over streamed Claude responses
+(`claude-haiku-5-5` at effort `low` by default). There are four tools:
+
+| Tool | What it does |
+| --- | --- |
+| `search_knowledge_base` | Hybrid search; passages come back numbered, and the model cites `[1]`, `[2]` |
+| `get_points_balance` | The current customer's balance and points expiring soon |
+| `start_redemption` | Checks the balance and stores a pending redemption in Redis; spends nothing |
+| `confirm_redemption` | Executes the pending redemption, but only from a **later** customer message |
+
+Guard rails are enforced in code, not only in the prompt:
+- **No customer id in any tool.** The customer comes from the request, so a prompt injection
+  ("show CUST1002's balance") has nothing to target.
+- **Two-step redemption checked by turn number.** `confirm_redemption` fails if the confirmation
+  isn't from a later customer message than `start_redemption`. The model can't redeem and
+  confirm in one reply, even when told "I confirm in advance".
+- **Idempotent redemption.** The pending id is the ledger's idempotency key, so a retried confirm
+  can't double-spend.
+- **Validated inputs.** Tool inputs are checked with pydantic (schemas are `strict`, inputs
+  stream eagerly). A tool call cut off by `max_tokens` is never executed.
+- **Instructions vs data.** Document text is treated as data. Operator context (bank, customer,
+  detected language) goes in a mid-conversation `system` message, not the user turn.
+
+**Prompt caching:** the system prompt and tools never change between requests, so they are cached.
+
+**Memory:** Redis stores the last 20 user/assistant messages per customer (24h TTL), keeping
+only text, not tool results.
+
+**Streaming:** `/chat/stream` sends SSE events: `meta`, `token`, `tool_call`, `tool_result`, and
+then `done` or `error`. `done` includes sources, tool calls and token usage.
+
+### Voice
+
+`/voice/transcribe` and `/voice/chat` run **faster-whisper `small`** (int8, CPU) inside the API
+container. It's free, needs no key, and the model is baked into the image. Whisper sometimes labels
+Hindi speech as Urdu and writes Perso-Arabic script, so the service detects the language first,
+restricts it to Hindi or English, and transcribes with that language fixed.
+
 ### Multi-tenancy
 
 Every table carries `tenant_id`, and every query filters on it. `chunks.tenant_id` is denormalised
@@ -63,13 +115,15 @@ makes each redemption idempotent.
 Requires Docker.
 
 ```bash
-cp .env.example .env
+cp .env.example .env               # then set ANTHROPIC_API_KEY for /chat
 docker compose up -d --build        # postgres, redis, migrate (one-shot), api
-docker compose exec api python -m scripts.seed   # demo tenants, customers, documents
+docker compose exec api python -m scripts.seed          # demo tenants, customers, documents
+docker compose exec api python -m scripts.reindex_text  # (re)build lexical + phonetic text for existing chunks
 open http://localhost:8000/docs
 ```
 
-The first build downloads CPU-only PyTorch and bakes the embedding model into the image (~2 GB).
+The first build downloads CPU-only PyTorch and bakes the embedding and Whisper models into the
+image (~2.5 GB). Host ports: API 8000, Postgres 5434, Redis 6380 (change them in `.env`).
 
 ### Try it
 
@@ -89,8 +143,20 @@ curl -s localhost:8000/customers/CUST1001/points
 curl -s localhost:8000/customers/CUST1001/redeem -H 'content-type: application/json' \
   -d '{"points": 500, "reference": "order-123"}'
 
-# Baseline chat
+# Agent chat (needs ANTHROPIC_API_KEY)
 curl -s localhost:8000/chat -H 'content-type: application/json' \
+  -d '{"customer_ref": "CUST1001", "message": "mere kitne points hai?"}'
+
+# Streaming (SSE): watch tokens and tool calls arrive
+curl -N localhost:8000/chat/stream -H 'content-type: application/json' \
+  -d '{"customer_ref": "CUST1001", "message": "FD rate for senior citizens 1 year?"}'
+
+# Voice
+curl -s localhost:8000/voice/transcribe -F audio=@tests/fixtures/points_expiry_hi.wav
+curl -s localhost:8000/voice/chat -F customer_ref=CUST1001 -F audio=@tests/fixtures/points_question_en.wav
+
+# Phase 1 keyword router, no LLM (kept as the eval baseline)
+curl -s localhost:8000/chat/baseline -H 'content-type: application/json' \
   -d '{"customer_ref": "CUST1001", "message": "mere kitne points hai?"}'
 
 # Another tenant
@@ -104,10 +170,15 @@ curl -s localhost:8000/search -H 'X-Tenant: second-bank' -H 'content-type: appli
 | POST | `/documents` | Upload and ingest a file (deduplicated by SHA-256 per tenant) |
 | GET | `/documents` | List the tenant's documents |
 | DELETE | `/documents/{id}` | Delete a document and its chunks |
-| POST | `/search` | Hybrid / vector / lexical search with per-retriever ranks |
+| POST | `/search` | Hybrid / vector / lexical search with per-retriever ranks (`lexical` = keyword + phonetic) |
 | GET | `/customers/{ref}/points` | Balance and points expiring in 30 days |
 | POST | `/customers/{ref}/redeem` | Idempotent redemption |
-| POST | `/chat` | Baseline keyword-routed chat |
+| POST | `/chat` | Agent chat turn (JSON) |
+| POST | `/chat/stream` | Agent chat turn as Server-Sent Events |
+| GET / DELETE | `/chat/memory/{ref}` | View / clear a customer's conversation memory |
+| POST | `/chat/baseline` | Phase 1 keyword router (no LLM), the eval baseline |
+| POST | `/voice/transcribe` | Speech to text (Hindi / English) |
+| POST | `/voice/chat` | Speech to text, then an agent chat turn |
 | GET | `/health/live`, `/health/ready` | Liveness; readiness checks Postgres and Redis |
 
 ## Configuration
@@ -130,25 +201,28 @@ The `migrate` service runs `alembic upgrade head` on every `docker compose up`, 
 
 ```bash
 uv venv --python 3.12 && uv pip install -r requirements-dev.txt
-pytest tests                       # unit tests always run; integration tests need the stack + seed
+pytest tests   # unit tests (incl. agent loop with a fake LLM) always run; integration tests need
+               # the stack + seed, and the LLM ones also need ANTHROPIC_API_KEY in the API container
 ```
 
 ## Layout
 
 ```
 app/
-  api/          routers: chat, documents, search, loyalty, health; deps (tenant, session, redis)
-  services/     text normalisation, parsing, chunking, embeddings, ingestion, search, loyalty
+  agent/        LLM wrapper, agent loop, tools, prompts, chat-turn orchestration
+  api/          routers: chat (+stream, memory), chat_baseline, voice, documents, search, loyalty, health
+  services/     text + language (detection, transliteration, phonetic keys), parsing, chunking,
+                embeddings, ingestion, search, loyalty, memory, speech
   models.py     SQLAlchemy models        config.py   env settings        db.py   async engine
 alembic/        migrations
 data/seed/      fictional bank documents (English, Hinglish, Hindi) + tenants.json
-scripts/seed.py idempotent demo data loader
+scripts/        seed.py (idempotent demo data), reindex_text.py (rebuild lexical/phonetic text)
 ```
 
 ## Roadmap
 
 - [x] Phase 1: pgvector, hybrid search, ingestion, Docker Compose, Alembic, env config
-- [ ] Phase 2: LLM tool calling, Redis conversation memory, transliteration, voice, SSE streaming
+- [x] Phase 2: LLM tool calling, Redis conversation memory, transliteration, voice, SSE streaming
 - [ ] Phase 3: RabbitMQ ingestion workers, semantic cache, rate limits, circuit breaker, JWT auth
 - [ ] Phase 4: 100+ query eval set, LLM-as-judge CI gate, prompt-injection suite, audit log
 - [ ] Phase 5: Langfuse, Prometheus + Grafana, load tests, Kubernetes on AWS

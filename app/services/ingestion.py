@@ -18,7 +18,7 @@ from app.models import Chunk, Document
 from app.services.chunking import chunk_sections
 from app.services.embeddings import embed_passages
 from app.services.parsing import mime_type_for, parse_document
-from app.services.text import lexical_text
+from app.services.text import lexical_text, phonetic_text
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,7 @@ async def ingest_document(
             chunk_index=p.index,
             content=p.content,
             lexical_text=lexical_text(f"{title} {p.content}"),
+            phonetic_text=phonetic_text(f"{title} {p.content}"),
             embedding=vector,
             meta=p.meta,
         )
