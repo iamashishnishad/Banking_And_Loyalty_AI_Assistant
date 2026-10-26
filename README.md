@@ -5,7 +5,7 @@ backend: one bank per tenant, documents and customers isolated per tenant.
 
 **Status: Phases 1–3 complete.**
 - **Phase 1:** hybrid retrieval over Postgres + pgvector, document ingestion, Docker Compose, Alembic, env config.
-- **Phase 2:** an LLM tool-calling agent (Gemini or Claude) with Redis conversation memory,
+- **Phase 2:** an LLM tool-calling agent (Azure OpenAI, Gemini or Claude) with Redis conversation memory,
   Hindi/Hinglish detection and transliteration, voice input via local Whisper, and SSE streaming.
 - **Phase 3:** JWT auth with tenant-from-token isolation, Redis rate limits per user and tenant,
   RabbitMQ ingestion workers, a Redis semantic answer cache, and an LLM fallback chain with
@@ -74,6 +74,7 @@ behind one interface ([llm.py](app/agent/llm.py)) and is picked with `LLM_PROVID
 | --- | --- | --- |
 | `gemini` | `gemini-2.5-flash` | Free tier works (5 requests/min, and one chat turn is about 2–3 requests). Thought signatures are replayed unchanged within a turn. |
 | `claude` | `claude-haiku-5-5`, effort `low` | Prompt caching on the system prompt and tools |
+| `openai` | `gpt-4.1-mini` (Azure OpenAI deployment) | Any OpenAI-compatible API: set `OPENAI_BASE_URL` to `https://<resource>.openai.azure.com/openai/v1/` and `OPENAI_MODEL` to the deployment name. Also works for OpenAI, Groq, etc. |
 
 The loop uses one message format and each adapter converts to and from it. Provider errors become
 `LLMError`, and a rate limit is shown to the customer as "busy, try again in a minute".

@@ -5,12 +5,14 @@ and talks to the LLMClient protocol, never to an SDK directly. Each provider ada
 
     claude  - Anthropic Messages API (native format)
     gemini  - Google Gemini via google-genai (converted both ways)
+    openai  - any OpenAI-compatible Chat Completions API, e.g. Azure OpenAI (converted both ways)
 
 That also lets tests use a scripted fake. ResilientLLM chains providers (primary, then fallback),
 each behind a circuit breaker; get_llm() returns that chain.
 """
 
 import asyncio
+import json
 import logging
 import os
 import uuid
@@ -21,6 +23,7 @@ from typing import Any, Protocol
 
 import anthropic
 import httpx
+import openai
 
 from app.config import get_settings
 from app.services.resilience import CircuitBreaker
@@ -68,11 +71,13 @@ class LLMClient(Protocol):
 
 
 def _claude_messages(messages: list[dict]) -> list[dict]:
-    """Assistant turns produced by Gemini (after a mid-turn fallback) are plain namespaces; the
-    Anthropic SDK needs dicts. Native Claude blocks pass through untouched."""
+    """Assistant turns produced by Gemini or OpenAI (after a mid-turn fallback) are plain
+    namespaces; the Anthropic SDK needs dicts. Native Claude blocks pass through untouched."""
     out = []
     for m in messages:
-        if m["role"] == "assistant" and isinstance(m["content"], _GeminiContent):
+        if m["role"] == "assistant" and isinstance(m["content"], list) and any(
+            isinstance(b, SimpleNamespace) for b in m["content"]
+        ):
             blocks = []
             for b in m["content"]:
                 if b.type == "text":
@@ -266,6 +271,118 @@ class GeminiLLM:
         yield FinalMessage(SimpleNamespace(content=_GeminiContent(blocks, parts), stop_reason=stop_reason, usage=usage))
 
 
+# --- OpenAI-compatible (Azure OpenAI, OpenAI, Groq, ...) ----------------------------------------
+
+_OPENAI_STOP_REASONS = {"tool_calls": "tool_use", "length": "max_tokens", "content_filter": "refusal"}
+
+
+class OpenAILLM:
+    def __init__(self, client: openai.AsyncOpenAI, model: str, max_tokens: int) -> None:
+        self.client = client
+        self.model = model
+        self.max_tokens = max_tokens
+
+    @staticmethod
+    def _tools(tools: list[dict]) -> list[dict]:
+        return [
+            {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
+            for t in tools
+        ]
+
+    @staticmethod
+    def _messages(system: str, messages: list[dict]) -> list[dict]:
+        out = [{"role": "system", "content": system}]
+        for m in messages:
+            role, content = m["role"], m["content"]
+            if isinstance(content, str):
+                out.append({"role": role, "content": content})
+            elif role == "assistant":  # blocks from any provider: .type text | tool_use (thinking etc. dropped)
+                text = "".join(b.text for b in content if b.type == "text")
+                calls = [
+                    {"id": b.id, "type": "function", "function": {"name": b.name, "arguments": json.dumps(b.input, ensure_ascii=False)}}
+                    for b in content
+                    if b.type == "tool_use"
+                ]
+                msg: dict = {"role": "assistant", "content": text or None}
+                if calls:
+                    msg["tool_calls"] = calls
+                out.append(msg)
+            else:  # tool results: one "tool" message each
+                for r in content:
+                    body = r["content"] if isinstance(r["content"], str) else json.dumps(r["content"], ensure_ascii=False)
+                    out.append({"role": "tool", "tool_call_id": r["tool_use_id"], "content": ("ERROR: " + body) if r.get("is_error") else body})
+        return out
+
+    async def stream(self, *, system: str, messages: list[dict], tools: list[dict]) -> AsyncIterator[TextDelta | FinalMessage]:
+        text: list[str] = []
+        calls: dict[int, dict] = {}  # streamed tool calls arrive in fragments, keyed by index
+        finish, usage = None, None
+        try:
+            stream = await self.client.chat.completions.create(
+                model=self.model,
+                messages=self._messages(system, messages),
+                tools=self._tools(tools),
+                max_completion_tokens=self.max_tokens,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+            async for chunk in stream:
+                if chunk.usage:
+                    usage = chunk.usage
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                finish = choice.finish_reason or finish
+                delta = choice.delta
+                if delta and delta.content:
+                    text.append(delta.content)
+                    yield TextDelta(delta.content)
+                for tc in (delta.tool_calls or []) if delta else []:
+                    call = calls.setdefault(tc.index, {"id": None, "name": "", "arguments": ""})
+                    call["id"] = tc.id or call["id"]
+                    if tc.function:
+                        call["name"] += tc.function.name or ""
+                        call["arguments"] += tc.function.arguments or ""
+        except openai.AuthenticationError as exc:
+            raise LLMError("LLM is not configured: the OpenAI-compatible API key was rejected.", public=True) from exc
+        except openai.RateLimitError as exc:
+            raise _RATE_LIMITED from exc
+        except openai.BadRequestError as exc:
+            if "content_filter" not in str(exc):
+                raise LLMError(f"OpenAI-compatible API error {exc.status_code}") from exc
+            finish = "content_filter"  # Azure's prompt filter rejects before streaming: a refusal
+        except openai.APIError as exc:
+            raise LLMError(f"OpenAI-compatible API error: {type(exc).__name__}") from exc
+
+        blocks = []
+        if text:
+            blocks.append(SimpleNamespace(type="text", text="".join(text)))
+        for _, call in sorted(calls.items()):
+            try:
+                args = json.loads(call["arguments"] or "{}")
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Unparseable arguments for tool {call['name']}") from exc  # the agent loop retries
+            blocks.append(
+                SimpleNamespace(type="tool_use", id=call["id"] or f"call_{uuid.uuid4().hex[:12]}", name=call["name"], input=args)
+            )
+        stop_reason = _OPENAI_STOP_REASONS.get(finish, "end_turn")
+        if calls and stop_reason == "end_turn":  # some compatible servers report "stop" with tool calls
+            stop_reason = "tool_use"
+        details = getattr(usage, "prompt_tokens_details", None)
+        yield FinalMessage(
+            SimpleNamespace(
+                content=blocks,
+                stop_reason=stop_reason,
+                usage=SimpleNamespace(
+                    input_tokens=usage.prompt_tokens if usage else 0,
+                    output_tokens=usage.completion_tokens if usage else 0,
+                    cache_read_input_tokens=(getattr(details, "cached_tokens", 0) or 0) if details else 0,
+                    cache_creation_input_tokens=0,
+                ),
+            )
+        )
+
+
 # --- fallback chain ----------------------------------------------------------------------------
 
 
@@ -332,10 +449,15 @@ class ResilientLLM:
 _llm: ResilientLLM | None = None
 
 
+_KEY_VARS = {
+    "claude": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "openai": ("OPENAI_API_KEY",),
+}
+
+
 def _has_key(provider: str) -> bool:
-    if provider == "gemini":
-        return bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
-    return bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"))
+    return any(os.getenv(name) for name in _KEY_VARS[provider])
 
 
 def _build(provider: str, model: str) -> LLMClient:
@@ -352,6 +474,11 @@ def _build(provider: str, model: str) -> LLMClient:
             )
         )
         return GeminiLLM(client, model, s.llm_max_tokens)
+    if provider == "openai":
+        client = openai.AsyncOpenAI(
+            base_url=s.openai_base_url or None, timeout=s.llm_timeout_seconds, max_retries=s.llm_max_retries
+        )
+        return OpenAILLM(client, model, s.llm_max_tokens)
     client = anthropic.AsyncAnthropic(timeout=s.llm_timeout_seconds, max_retries=s.llm_max_retries)
     return ClaudeLLM(client, model, s.llm_effort, s.llm_max_tokens)
 
@@ -362,11 +489,10 @@ def get_llm() -> LLMClient:
     global _llm
     s = get_settings()
     if not _has_key(s.llm_provider):
-        name = "GEMINI_API_KEY" if s.llm_provider == "gemini" else "ANTHROPIC_API_KEY"
-        raise LLMNotConfiguredError(f"LLM is not configured: set {name}.")
+        raise LLMNotConfiguredError(f"LLM is not configured: set {_KEY_VARS[s.llm_provider][0]}.")
 
     if _llm is None:
-        primary_model = s.gemini_model if s.llm_provider == "gemini" else s.llm_model
+        primary_model = {"gemini": s.gemini_model, "openai": s.openai_model}.get(s.llm_provider, s.llm_model)
         candidates = [(s.llm_provider, primary_model)]
         if s.llm_fallback_provider:
             if _has_key(s.llm_fallback_provider) and s.llm_fallback_model:

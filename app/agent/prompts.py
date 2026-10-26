@@ -41,14 +41,19 @@ tell them not to share it.
 
 _LANGUAGE_NAMES = {
     "english": "English",
-    "hindi": "Hindi (Devanagari script)",
+    "hindi": "Hindi in Devanagari script (e.g. 'आपके पॉइंट्स'), never Roman letters",
     "hinglish": "Hinglish (Roman script, Hindi-English mix)",
 }
 
 
 def context_note(bank_name: str, customer_name: str | None, language: Language) -> str:
     who = f"The customer is {customer_name}." if customer_name else "The customer's profile was not found."
-    return f"Bank: {bank_name}. {who} The customer's latest message is in {_LANGUAGE_NAMES[language]}; reply in that."
+    # Ends on a direct command: gpt-4.1-mini otherwise often copies the language of earlier replies
+    # in the history (a Hinglish history pulled ~1 in 4 English answers into Hinglish).
+    return (
+        f"Bank: {bank_name}. {who} The customer's latest message is in {_LANGUAGE_NAMES[language]}. "
+        f"Earlier messages may be in other languages; ignore that. Write your entire reply in {_LANGUAGE_NAMES[language]}."
+    )
 
 
 # Shown when the model returns no usable text (e.g. a refusal), in the customer's language.

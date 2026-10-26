@@ -159,6 +159,23 @@ async def _start_redemption(ctx: ToolContext, args: StartRedemptionInput) -> str
         raise ToolError("Customer not found") from exc
     if args.points > balance.points:
         raise ToolError(f"Insufficient points: balance is {balance.points}, requested {args.points}")
+    existing = await ctx.memory.get_pending_redemption()
+    if (
+        existing is not None
+        and existing.created_turn < ctx.turn
+        and (existing.points, existing.redemption_type) == (args.points, args.redemption_type)
+    ):
+        # Some models re-run step 1 when the customer says "yes". Replacing the pending redemption
+        # would reset its turn and make the confirmation look premature, so keep the original.
+        return json.dumps(
+            {
+                "status": "already_pending_from_earlier_message",
+                "points": existing.points,
+                "redemption_type": existing.redemption_type,
+                "current_balance": balance.points,
+                "next_step": "If the customer's latest message confirms it, call confirm_redemption now.",
+            }
+        )
     pending = PendingRedemption(
         id=f"rdm-{uuid.uuid4().hex[:12]}",
         points=args.points,

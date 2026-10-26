@@ -42,10 +42,14 @@ class Settings(BaseSettings):
     default_tenant: str = "demo-bank"
 
     # LLM agent. The SDKs read ANTHROPIC_API_KEY / GEMINI_API_KEY from the environment themselves.
-    llm_provider: Literal["claude", "gemini"] = "claude"
+    llm_provider: Literal["claude", "gemini", "openai"] = "claude"
     llm_model: str = "claude-haiku-5-5"  # used when llm_provider = claude
     llm_effort: str = "low"  # Claude only: low | medium | high; low keeps chat latency down
     gemini_model: str = "gemini-2.5-flash"  # used when llm_provider = gemini
+    # Any OpenAI-compatible Chat Completions API: Azure OpenAI (https://<resource>.openai.azure.com/openai/v1/),
+    # OpenAI, Groq, ... The key is OPENAI_API_KEY. On Azure, openai_model is the *deployment* name.
+    openai_base_url: str = ""
+    openai_model: str = "gpt-4.1-mini"
     llm_max_tokens: int = 8000
     llm_timeout_seconds: float = 60.0
     llm_max_retries: int = 2
@@ -78,7 +82,7 @@ class Settings(BaseSettings):
     rate_limit_tenant_burst: int = 100
 
     # LLM fallback + circuit breaker. Fallback is optional; an empty provider disables it.
-    llm_fallback_provider: Literal["", "claude", "gemini"] = ""
+    llm_fallback_provider: Literal["", "claude", "gemini", "openai"] = ""
     llm_fallback_model: str = ""
     llm_first_event_timeout_seconds: float = 25.0  # no first chunk by then: try the fallback
     circuit_failure_threshold: int = 3  # consecutive failures before the circuit opens
