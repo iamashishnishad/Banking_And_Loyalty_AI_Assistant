@@ -6,9 +6,12 @@ and talks to the LLMClient protocol, never to an SDK directly. Each provider ada
     claude  - Anthropic Messages API (native format)
     gemini  - Google Gemini via google-genai (converted both ways)
 
-That also lets tests use a scripted fake, and Phase 3 put a fallback/circuit breaker in front.
+That also lets tests use a scripted fake. ResilientLLM chains providers (primary, then fallback),
+each behind a circuit breaker; get_llm() returns that chain.
 """
 
+import asyncio
+import logging
 import os
 import uuid
 from collections.abc import AsyncIterator
@@ -20,6 +23,9 @@ import anthropic
 import httpx
 
 from app.config import get_settings
+from app.services.resilience import CircuitBreaker
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -30,6 +36,7 @@ class TextDelta:
 @dataclass
 class FinalMessage:
     message: Any  # .content (blocks), .stop_reason, .usage, shaped like anthropic.types.Message
+    model: str | None = None  # set by ResilientLLM: the model that actually answered
 
 
 class LLMError(Exception):
@@ -60,6 +67,23 @@ class LLMClient(Protocol):
 # --- Claude ------------------------------------------------------------------------------------
 
 
+def _claude_messages(messages: list[dict]) -> list[dict]:
+    """Assistant turns produced by Gemini (after a mid-turn fallback) are plain namespaces; the
+    Anthropic SDK needs dicts. Native Claude blocks pass through untouched."""
+    out = []
+    for m in messages:
+        if m["role"] == "assistant" and isinstance(m["content"], _GeminiContent):
+            blocks = []
+            for b in m["content"]:
+                if b.type == "text":
+                    blocks.append({"type": "text", "text": b.text})
+                elif b.type == "tool_use":
+                    blocks.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
+            m = {"role": "assistant", "content": blocks}
+        out.append(m)
+    return out
+
+
 class ClaudeLLM:
     def __init__(self, client: anthropic.AsyncAnthropic, model: str, effort: str, max_tokens: int) -> None:
         self.client = client
@@ -76,7 +100,7 @@ class ClaudeLLM:
                 # let top-level cache_control also cache the growing conversation within a tool loop.
                 system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                 cache_control={"type": "ephemeral"},
-                messages=messages,
+                messages=_claude_messages(messages),
                 tools=tools,
                 output_config={"effort": self.effort},
             ) as stream:
@@ -149,6 +173,17 @@ class GeminiLLM:
                     if block.type == "tool_use":
                         tool_names[block.id] = block.name
                 contents.append(types.Content(role="model", parts=content.parts))
+            elif role == "assistant":  # Claude blocks, after a mid-turn fallback from Claude
+                parts = []
+                for block in content:
+                    if block.type == "text":
+                        parts.append(types.Part(text=block.text))
+                    elif block.type == "tool_use":
+                        tool_names[block.id] = block.name
+                        parts.append(
+                            types.Part(function_call=types.FunctionCall(id=block.id, name=block.name, args=block.input))
+                        )
+                contents.append(types.Content(role="model", parts=parts))
             else:  # tool results
                 parts = []
                 for r in content:
@@ -231,36 +266,116 @@ class GeminiLLM:
         yield FinalMessage(SimpleNamespace(content=_GeminiContent(blocks, parts), stop_reason=stop_reason, usage=usage))
 
 
+# --- fallback chain ----------------------------------------------------------------------------
+
+
+class ResilientLLM:
+    """Tries each provider in order, skipping any whose circuit is open.
+
+    A provider is abandoned only if it fails before yielding anything: an LLMError, or no first
+    event within `first_event_timeout`. Once text has reached the client, switching providers
+    would duplicate it, so a mid-stream failure propagates. ValueError (an unparseable tool call)
+    is the model's fault, not an outage: it propagates for the agent loop to retry and doesn't
+    count against the circuit.
+    """
+
+    def __init__(self, routes: list[tuple[LLMClient, CircuitBreaker]], first_event_timeout: float) -> None:
+        self.routes = routes
+        self.first_event_timeout = first_event_timeout
+
+    @property
+    def model(self) -> str:
+        return self.routes[0][0].model
+
+    async def stream(self, *, system: str, messages: list[dict], tools: list[dict]) -> AsyncIterator[TextDelta | FinalMessage]:
+        last_error: LLMError | None = None
+        for llm, breaker in self.routes:
+            if not breaker.allow():
+                logger.info("Skipping %s: circuit open", llm.model)
+                continue
+            events = aiter(llm.stream(system=system, messages=messages, tools=tools))
+            try:
+                async with asyncio.timeout(self.first_event_timeout):
+                    first = await anext(events)
+            except ValueError:
+                await events.aclose()
+                raise
+            except (LLMError, TimeoutError, StopAsyncIteration) as exc:
+                await events.aclose()
+                breaker.record_failure()
+                logger.warning("%s failed before its first event (%s); trying next provider", llm.model, type(exc).__name__)
+                last_error = exc if isinstance(exc, LLMError) else LLMError(f"{llm.model}: {type(exc).__name__}")
+                continue
+
+            try:
+                event = first
+                while True:
+                    if isinstance(event, FinalMessage):
+                        event.model = llm.model
+                    yield event
+                    try:
+                        event = await anext(events)
+                    except StopAsyncIteration:
+                        break
+            except LLMError:
+                breaker.record_failure()
+                raise
+            finally:
+                await events.aclose()
+            breaker.record_success()
+            return
+        raise last_error or LLMError("All LLM providers are unavailable (circuits open).")
+
+
 # --- factory -----------------------------------------------------------------------------------
 
-_llm: LLMClient | None = None
+_llm: ResilientLLM | None = None
+
+
+def _has_key(provider: str) -> bool:
+    if provider == "gemini":
+        return bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+    return bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"))
+
+
+def _build(provider: str, model: str) -> LLMClient:
+    s = get_settings()
+    if provider == "gemini":
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(
+            http_options=types.HttpOptions(
+                timeout=int(s.llm_timeout_seconds * 1000),
+                # Free-tier Gemini returns 503 "high demand" fairly often; retry with backoff.
+                retry_options=types.HttpRetryOptions(attempts=s.llm_max_retries + 1),
+            )
+        )
+        return GeminiLLM(client, model, s.llm_max_tokens)
+    client = anthropic.AsyncAnthropic(timeout=s.llm_timeout_seconds, max_retries=s.llm_max_retries)
+    return ClaudeLLM(client, model, s.llm_effort, s.llm_max_tokens)
 
 
 def get_llm() -> LLMClient:
-    """Provider from LLM_PROVIDER. Credentials are checked here, so a missing key becomes a clean
-    503 before any response (or stream) has started."""
+    """Primary provider from LLM_PROVIDER, plus LLM_FALLBACK_PROVIDER if set. Credentials are
+    checked here, so a missing key becomes a clean 503 before any response (or stream) has started."""
     global _llm
     s = get_settings()
-    if s.llm_provider == "gemini":
-        if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
-            raise LLMNotConfiguredError("LLM is not configured: set GEMINI_API_KEY.")
-    elif not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")):
-        raise LLMNotConfiguredError("LLM is not configured: set ANTHROPIC_API_KEY.")
+    if not _has_key(s.llm_provider):
+        name = "GEMINI_API_KEY" if s.llm_provider == "gemini" else "ANTHROPIC_API_KEY"
+        raise LLMNotConfiguredError(f"LLM is not configured: set {name}.")
 
     if _llm is None:
-        if s.llm_provider == "gemini":
-            from google import genai
-            from google.genai import types
-
-            client = genai.Client(
-                http_options=types.HttpOptions(
-                    timeout=int(s.llm_timeout_seconds * 1000),
-                    # Free-tier Gemini returns 503 "high demand" fairly often; retry with backoff.
-                    retry_options=types.HttpRetryOptions(attempts=s.llm_max_retries + 1),
-                )
-            )
-            _llm = GeminiLLM(client, s.gemini_model, s.llm_max_tokens)
-        else:
-            client = anthropic.AsyncAnthropic(timeout=s.llm_timeout_seconds, max_retries=s.llm_max_retries)
-            _llm = ClaudeLLM(client, s.llm_model, s.llm_effort, s.llm_max_tokens)
+        primary_model = s.gemini_model if s.llm_provider == "gemini" else s.llm_model
+        candidates = [(s.llm_provider, primary_model)]
+        if s.llm_fallback_provider:
+            if _has_key(s.llm_fallback_provider) and s.llm_fallback_model:
+                candidates.append((s.llm_fallback_provider, s.llm_fallback_model))
+            else:
+                logger.warning("LLM fallback %s ignored: no API key or model set", s.llm_fallback_provider)
+        routes = [
+            (_build(provider, model), CircuitBreaker(f"llm:{model}", s.circuit_failure_threshold, s.circuit_reset_seconds))
+            for provider, model in candidates
+        ]
+        _llm = ResilientLLM(routes, s.llm_first_event_timeout_seconds)
     return _llm

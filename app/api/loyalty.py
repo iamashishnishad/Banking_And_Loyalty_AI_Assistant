@@ -1,8 +1,8 @@
 from dataclasses import asdict
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.api.deps import SessionDep, TenantDep
+from app.api.deps import SessionDep, TenantDep, check_customer_path
 from app.schemas import BalanceOut, RedeemIn, RedeemOut
 from app.services.loyalty import (
     CustomerNotFoundError,
@@ -12,7 +12,8 @@ from app.services.loyalty import (
     redeem_points,
 )
 
-router = APIRouter(prefix="/customers/{customer_ref}", tags=["loyalty"])
+# Customers may only see and spend their own points; staff and admins any customer in the tenant.
+router = APIRouter(prefix="/customers/{customer_ref}", tags=["loyalty"], dependencies=[Depends(check_customer_path)])
 
 
 @router.get("/points", response_model=BalanceOut)

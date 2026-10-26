@@ -1,11 +1,13 @@
 """Tools the agent can call, their JSON schemas, and their implementations.
 
-Security boundary: the tenant and customer come from the request (later, the JWT), never from
+Security boundary: the tenant and customer come from the JWT-authenticated request, never from
 the model. No tool takes a customer id, so a prompt-injected "check CUST1002's balance" has
 nothing to aim at. Inputs are validated with pydantic before anything runs.
 """
 
+import asyncio
 import json
+import logging
 import uuid
 from dataclasses import dataclass, field
 from typing import Literal
@@ -14,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.services.loyalty import (
     CustomerNotFoundError,
     DuplicateRedemptionError,
@@ -23,6 +26,8 @@ from app.services.loyalty import (
 )
 from app.services.memory import ConversationMemory, PendingRedemption
 from app.services.search import SearchHit, hybrid_search
+
+logger = logging.getLogger(__name__)
 
 RedemptionType = Literal["statement_credit", "travel", "gift_voucher", "airline_miles"]
 
@@ -211,6 +216,7 @@ _HANDLERS = {
     "start_redemption": (StartRedemptionInput, _start_redemption),
     "confirm_redemption": (NoInput, _confirm_redemption),
 }
+_READ_ONLY_TOOLS = {"search_knowledge_base", "get_points_balance"}
 
 
 async def run_tool(ctx: ToolContext, name: str, raw_input: object) -> tuple[str, bool]:
@@ -223,6 +229,15 @@ async def run_tool(ctx: ToolContext, name: str, raw_input: object) -> tuple[str,
     except ValidationError as exc:
         return json.dumps({"INVALID_INPUT": json.dumps(raw_input, default=str), "errors": exc.errors()}, default=str), True
     try:
-        return await handler(ctx, args), False
+        if name not in _READ_ONLY_TOOLS:
+            # Never cut off a redemption mid-flight: its outcome would be unknown.
+            return await handler(ctx, args), False
+        async with asyncio.timeout(get_settings().tool_timeout_seconds):
+            return await handler(ctx, args), False
     except ToolError as exc:
         return str(exc), True
+    except TimeoutError:
+        logger.warning("Tool %s timed out", name)
+        if ctx.session is not None:
+            await ctx.session.rollback()  # the cancelled query may have left the transaction unusable
+        return f"{name} timed out. Tell the customer the information is temporarily unavailable.", True

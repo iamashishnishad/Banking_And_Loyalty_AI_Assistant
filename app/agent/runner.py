@@ -7,7 +7,7 @@ JSON endpoint):
     tool_result {"name", "is_error", "preview"}
     token       {"text"}
     done        {"answer", "sources", "tool_calls", "usage", "stop_reason", "model"}
-    error       {"message"}
+    error       {"message", "code"}   code: llm_unavailable (every provider failed) | agent_error
 """
 
 import logging
@@ -68,6 +68,7 @@ async def run_agent(
     tool_calls: list[dict] = []
     answer_parts: list[str] = []
     stop_reason = None
+    answered_by = llm.model  # the fallback chain reports the model that actually answered
 
     try:
         for _ in range(settings.agent_max_tool_rounds):
@@ -81,6 +82,7 @@ async def run_agent(
                             yield AgentEvent("token", {"text": event.text})
                         elif isinstance(event, FinalMessage):
                             message = event.message
+                            answered_by = event.model or answered_by
                     break
                 except ValueError:
                     # The SDK could not parse a streamed tool input at all. There is no tool_use id
@@ -129,7 +131,8 @@ async def run_agent(
             error_message = "The assistant is temporarily unavailable."  # don't leak provider details
         else:
             error_message = str(exc)
-        yield AgentEvent("error", {"message": error_message})
+        code = "llm_unavailable" if isinstance(exc, LLMError) else "agent_error"
+        yield AgentEvent("error", {"message": error_message, "code": code})
         return
 
     answer = "\n\n".join(p.strip() for p in answer_parts if p.strip()) or FALLBACK_REPLY[language]
@@ -138,7 +141,7 @@ async def run_agent(
         {
             "answer": answer,
             "language": language,
-            "model": llm.model,
+            "model": answered_by,
             "stop_reason": stop_reason,
             "tool_calls": tool_calls,
             "sources": [

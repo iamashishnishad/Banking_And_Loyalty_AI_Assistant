@@ -54,16 +54,17 @@ def _parse_text(data: bytes) -> list[Section]:
 
 def parse_document(filename: str, data: bytes) -> list[Section]:
     ext = PurePath(filename).suffix.lower()
-    if ext == ".pdf":
-        sections = _parse_pdf(data)
-    elif ext == ".docx":
-        sections = _parse_docx(data)
-    elif ext in {".txt", ".md"}:
-        sections = _parse_text(data)
-    else:
+    parsers = {".pdf": _parse_pdf, ".docx": _parse_docx, ".txt": _parse_text, ".md": _parse_text}
+    if ext not in parsers:
         raise UnsupportedDocumentError(
             f"Unsupported file type '{ext}'. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
         )
+    try:
+        sections = parsers[ext](data)
+    except Exception as exc:
+        # pypdf / python-docx raise their own error types for corrupt files. Retrying can't fix
+        # a corrupt file, so the ingestion worker treats this as a permanent failure.
+        raise UnsupportedDocumentError(f"Could not read '{filename}': {type(exc).__name__}") from exc
     if not sections:
         # Usually a scanned PDF with no text layer; OCR is out of scope for now.
         raise UnsupportedDocumentError(f"No extractable text found in '{filename}'")

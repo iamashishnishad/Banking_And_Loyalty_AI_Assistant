@@ -130,7 +130,9 @@ def test_tool_round_limit(monkeypatch):
 
 def test_provider_error_becomes_error_event(monkeypatch):
     events, _ = _run(FakeLLM([LLMError("Gemini is unavailable (503)")]), monkeypatch)
-    assert events[-1] == runner.AgentEvent("error", {"message": "The assistant is temporarily unavailable."})
+    assert events[-1] == runner.AgentEvent(
+        "error", {"message": "The assistant is temporarily unavailable.", "code": "llm_unavailable"}
+    )
 
 
 def test_rejected_key_message_is_passed_through(monkeypatch):

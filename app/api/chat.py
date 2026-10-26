@@ -4,7 +4,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from redis.asyncio import Redis
 from sqlalchemy import select
@@ -12,7 +12,14 @@ from sqlalchemy import select
 from app.agent.llm import get_llm
 from app.agent.runner import AgentEvent
 from app.agent.service import chat_turn
-from app.api.deps import RedisDep, SessionDep, TenantDep
+from app.api.deps import (
+    PrincipalDep,
+    RedisDep,
+    SessionDep,
+    TenantDep,
+    authorize_customer,
+    check_customer_path,
+)
 from app.models import Customer
 from app.schemas import ChatIn, ChatOut, MemoryOut
 from app.services.memory import ConversationMemory
@@ -29,10 +36,14 @@ async def ensure_customer(session, tenant_id: uuid.UUID, customer_ref: str) -> N
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Customer not found")
 
 
-async def run_chat(redis: Redis, tenant_id: uuid.UUID, customer_ref: str, message: str) -> ChatOut:
+async def run_chat(
+    redis: Redis, tenant_id: uuid.UUID, customer_ref: str, message: str, use_cache: bool = True
+) -> ChatOut:
     """Run a full turn without streaming and return the final result."""
     llm = get_llm()
-    async for event in chat_turn(llm=llm, redis=redis, tenant_id=tenant_id, customer_ref=customer_ref, message=message):
+    async for event in chat_turn(
+        llm=llm, redis=redis, tenant_id=tenant_id, customer_ref=customer_ref, message=message, use_cache=use_cache
+    ):
         if event.type == "error":
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, event.data["message"])
         if event.type == "done":
@@ -41,9 +52,12 @@ async def run_chat(redis: Redis, tenant_id: uuid.UUID, customer_ref: str, messag
 
 
 @router.post("", response_model=ChatOut)
-async def chat(body: ChatIn, session: SessionDep, tenant_id: TenantDep, redis: RedisDep) -> ChatOut:
+async def chat(
+    body: ChatIn, session: SessionDep, tenant_id: TenantDep, redis: RedisDep, principal: PrincipalDep
+) -> ChatOut:
+    authorize_customer(principal, body.customer_ref)
     await ensure_customer(session, tenant_id, body.customer_ref)
-    return await run_chat(redis, tenant_id, body.customer_ref, body.message)
+    return await run_chat(redis, tenant_id, body.customer_ref, body.message, body.use_cache)
 
 
 def _sse(event: AgentEvent) -> str:
@@ -55,13 +69,21 @@ def _sse(event: AgentEvent) -> str:
     response_class=StreamingResponse,
     responses={200: {"content": {"text/event-stream": {}}, "description": "meta, token, tool_call, tool_result, done | error"}},
 )
-async def chat_stream(body: ChatIn, session: SessionDep, tenant_id: TenantDep, redis: RedisDep) -> StreamingResponse:
+async def chat_stream(
+    body: ChatIn, session: SessionDep, tenant_id: TenantDep, redis: RedisDep, principal: PrincipalDep
+) -> StreamingResponse:
+    authorize_customer(principal, body.customer_ref)
     await ensure_customer(session, tenant_id, body.customer_ref)
     llm = get_llm()  # raises before the stream starts, so a missing key is a proper 503
 
     async def frames() -> AsyncIterator[str]:
         async for event in chat_turn(
-            llm=llm, redis=redis, tenant_id=tenant_id, customer_ref=body.customer_ref, message=body.message
+            llm=llm,
+            redis=redis,
+            tenant_id=tenant_id,
+            customer_ref=body.customer_ref,
+            message=body.message,
+            use_cache=body.use_cache,
         ):
             yield _sse(event)
 
@@ -73,12 +95,14 @@ async def chat_stream(body: ChatIn, session: SessionDep, tenant_id: TenantDep, r
     )
 
 
-@router.get("/memory/{customer_ref}", response_model=MemoryOut)
+@router.get("/memory/{customer_ref}", response_model=MemoryOut, dependencies=[Depends(check_customer_path)])
 async def get_memory(customer_ref: str, tenant_id: TenantDep, redis: RedisDep) -> MemoryOut:
     messages = await ConversationMemory(redis, tenant_id, customer_ref).history()
     return MemoryOut(customer_ref=customer_ref, messages=messages)
 
 
-@router.delete("/memory/{customer_ref}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/memory/{customer_ref}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(check_customer_path)]
+)
 async def clear_memory(customer_ref: str, tenant_id: TenantDep, redis: RedisDep) -> None:
     await ConversationMemory(redis, tenant_id, customer_ref).clear()
