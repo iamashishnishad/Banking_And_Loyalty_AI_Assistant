@@ -3,10 +3,13 @@
 A Hindi / Hinglish / English assistant for banking and rewards questions, built as a multi-tenant
 backend: one bank per tenant, documents and customers isolated per tenant.
 
-**Status: Phases 1–2 complete.**
+**Status: Phases 1–3 complete.**
 - **Phase 1:** hybrid retrieval over Postgres + pgvector, document ingestion, Docker Compose, Alembic, env config.
 - **Phase 2:** an LLM tool-calling agent (Gemini or Claude) with Redis conversation memory,
   Hindi/Hinglish detection and transliteration, voice input via local Whisper, and SSE streaming.
+- **Phase 3:** JWT auth with tenant-from-token isolation, Redis rate limits per user and tenant,
+  RabbitMQ ingestion workers, a Redis semantic answer cache, and an LLM fallback chain with
+  circuit breakers, timeouts and a no-LLM degraded mode.
 
 ## Architecture
 
@@ -23,9 +26,14 @@ backend: one bank per tenant, documents and customers isolated per tenant.
                      │  hybrid search: vector (HNSW) + lexical (tsvector) + phonetic,  RRF    │
                      │  ingestion: PDF/DOCX/MD/TXT → chunk → embed → store                    │
                      └──────────────┬──────────────────────────────────────┬──────────────────┘
-                         Postgres 17 + pgvector 0.8                   Redis 7
+                         Postgres 17 + pgvector 0.8                   Redis 8
                          tenants, documents, chunks,                  conversation memory, turn counter,
-                         customers, points_ledger                     pending redemptions, query-embedding cache
+                         customers, points_ledger, jobs               pending redemptions, query-embedding cache,
+                                                                      semantic answer cache (vector index), rate limits
+   POST /documents ─▶ jobs row ─▶ RabbitMQ ─▶ worker(s): parse → chunk → embed → store
+
+   Every request: JWT (tenant + role) ─▶ rate limit (user + tenant buckets) ─▶ route
+   /chat: semantic cache ─▶ agent (primary LLM ⇢ fallback LLM, circuit breakers) ─▶ no-LLM baseline
 ```
 
 ### Hybrid search
@@ -106,12 +114,94 @@ container. It's free, needs no key, and the model is baked into the image. Whisp
 Hindi speech as Urdu and writes Perso-Arabic script, so the service detects the language first,
 restricts it to Hindi or English, and transcribes with that language fixed.
 
-### Multi-tenancy
+### Multi-tenancy and auth
 
 Every table carries `tenant_id`, and every query filters on it. `chunks.tenant_id` is denormalised
 so search doesn't need a join. HNSW runs with `hnsw.iterative_scan = relaxed_order` so the tenant
-filter can't starve the top-k. In Phase 1 the tenant comes from the `X-Tenant` header; Phase 3 takes
-it from the JWT.
+filter can't starve the top-k.
+
+The tenant comes from a signed JWT (HS256, algorithm pinned; `iss`, `aud` and `exp` required), never
+from a header the caller controls. An `X-Tenant` header is ignored. Redis keys (memory, cache,
+rate limits) are tenant-scoped too. [auth.py](app/services/auth.py) defines three roles:
+
+| Role | Can do |
+| --- | --- |
+| `customer` | Only their own `customer_ref` (chat, voice, points, redeem, memory), plus search |
+| `staff` | Any customer in their tenant (e.g. a call-centre agent) |
+| `admin` | Staff rights, plus document upload/delete and job status |
+
+`scripts/issue_token.py` stands in for an identity provider. Every route except `/health/*` needs a token.
+
+### Rate limits
+
+Each request takes a token from two Redis token buckets: one per user (default 30/min, burst 10)
+and one per tenant (600/min, burst 100). Both are checked and charged in a single Lua script
+([ratelimit.py](app/services/ratelimit.py)), so the check is atomic across API replicas, a
+request blocked by the tenant bucket doesn't spend the user's token, and Redis's own clock is
+used. Over the limit: `429` with `Retry-After`. If Redis is down the limiter fails open.
+
+### Async ingestion (RabbitMQ)
+
+`POST /documents` validates the file (type, size, duplicate by SHA-256), stores a `jobs` row with
+the bytes, publishes the job id and returns **202**. A worker ([app/worker.py](app/worker.py))
+parses, chunks and embeds it. Poll `GET /documents/jobs/{id}`.
+
+```
+API ──publish {job_id}──▶ jobs ──▶ worker ──ack──▶ done
+                           │  ▲        │ transient error, attempts < 3
+              reject ──────┘  └── jobs.retry (10 s TTL) ◀──┘
+                ▼
+            jobs.dead   (corrupt file, or out of attempts)
+```
+
+Delivery is at-least-once, so every step is idempotent. Jobs are claimed with a conditional
+`UPDATE`, so a duplicate message for a finished job is dropped. Ingestion dedups on
+`(tenant, sha256)`. A message is acked only after the outcome is committed. Postgres is the
+source of truth: if RabbitMQ is down the upload still returns 202, and the worker's sweeper
+re-publishes jobs left `queued`. A corrupt file fails at once without retries. Scale with
+`docker compose up -d --scale worker=3`. Management UI: http://localhost:15673 (guest/guest).
+
+### Semantic cache
+
+A policy question close enough to one already answered gets the stored answer back, with no
+LLM call ([semantic_cache.py](app/services/semantic_cache.py)). Entries live in Redis 8's
+built-in vector index (HNSW, cosine). Lookup is a filtered KNN on tenant, reply language and
+knowledge-base version; uploading or deleting a document bumps the version, so stale answers stop
+matching at once.
+
+Only answers that can't depend on who's asking are cached: the question has no first-person or
+account words (*my, mere, मेरे, redeem, confirm …*), the agent used only `search_knowledge_base`,
+and the answer doesn't contain the customer's name. Balances and redemptions always reach the LLM.
+
+The threshold was calibrated with `scripts/calibrate_cache.py`. e5 similarities run high:
+*"FD rate for senior citizens 1 year"* vs *"… 2 years"* scores **0.970**, above most true
+paraphrases. So a hit also needs the **same numbers** in both questions:
+
+| Rule | Paraphrases hit | False hits |
+| --- | --- | --- |
+| similarity ≥ 0.95 | 7/9 | 2/9 |
+| similarity ≥ 0.965 + number guard (default) | 5/9 | **0/9** |
+
+A cache hit returned in **1.8 ms with 0 tokens**. The same question uncached took ~2.9k tokens.
+`"use_cache": false` in the request forces a fresh answer, for evals or "regenerate"; the fresh
+answer still refreshes the cache.
+
+### Reliability
+
+| Failure | What happens |
+| --- | --- |
+| Primary LLM errors or sends nothing within 25 s | The round goes to `LLM_FALLBACK_PROVIDER`/`MODEL` (may be a different provider: message history converts both ways) |
+| 3 consecutive failures | That provider's circuit opens: skipped for 30 s, then one trial request |
+| Failure after text has streamed | Not retried elsewhere, since that would duplicate text; reported as an error |
+| Every LLM down | `/chat` answers from the no-LLM baseline (balance or extractive search answer) with `degraded: true` |
+| Slow search / balance tool | 15 s timeout, reported to the model as a tool error; redemptions are never cut off |
+| Slow SQL | `statement_timeout` 15 s; Redis socket timeout 5 s |
+| SDK-level | Anthropic / Gemini SDKs retry 429/5xx with backoff before a failure counts |
+
+The `model` field of each reply shows which model actually answered. In testing, the free-tier
+Gemini quota (20 requests/day on `gemini-2.5-flash`) ran out mid-run. The circuit opened after 3
+failures and traffic moved to `gemini-3.5-flash-lite`. Before the fallback was configured
+correctly, the same outage was served by the degraded baseline instead of returning errors.
 
 ### Points ledger
 
@@ -124,71 +214,84 @@ makes each redemption idempotent.
 Requires Docker.
 
 ```bash
-cp .env.example .env               # then set GEMINI_API_KEY (or LLM_PROVIDER=claude + ANTHROPIC_API_KEY)
-docker compose up -d --build        # postgres, redis, migrate (one-shot), api
+cp .env.example .env               # then set JWT_SECRET and GEMINI_API_KEY (or LLM_PROVIDER=claude + ANTHROPIC_API_KEY)
+docker compose up -d --build        # postgres, redis, rabbitmq, migrate (one-shot), api, worker
 docker compose exec api python -m scripts.seed          # demo tenants, customers, documents
 docker compose exec api python -m scripts.reindex_text  # (re)build lexical + phonetic text for existing chunks
 open http://localhost:8000/docs
 ```
 
 The first build downloads CPU-only PyTorch and bakes the embedding and Whisper models into the
-image (~2.5 GB). Host ports: API 8000, Postgres 5434, Redis 6380 (change them in `.env`).
+image (~2.5 GB). Host ports: API 8000, Postgres 5434, Redis 6380, RabbitMQ 5673 / UI 15673
+(change them in `.env`).
 
 ### Try it
 
 ```bash
+# Tokens (stand-in for an identity provider)
+token() { docker compose exec -T api python -m scripts.issue_token "$@"; }
+CUST=$(token --tenant demo-bank --role customer --customer CUST1001)
+ADMIN=$(token --tenant demo-bank --role admin)
+SECOND=$(token --tenant second-bank --role admin)
+alias api='curl -s -H "Authorization: Bearer $CUST"'
+
 # Hinglish, Hindi and English questions against the same documents
-curl -s localhost:8000/search -H 'content-type: application/json' \
+api localhost:8000/search -H 'content-type: application/json' \
   -d '{"query": "mere points kab expire honge", "top_k": 3}' | jq '.hits[] | {document_title, score, vector_rank, lexical_rank}'
 
-curl -s localhost:8000/search -H 'content-type: application/json' \
+api localhost:8000/search -H 'content-type: application/json' \
   -d '{"query": "मेरे पॉइंट्स कब खत्म होंगे"}' | jq '.hits[0].content'
 
-# Upload a document (PDF, DOCX, MD, TXT)
-curl -s localhost:8000/documents -F file=@policy.pdf
+# Upload a document (admin; PDF, DOCX, MD, TXT): 202 + job, then poll it
+curl -s localhost:8000/documents -H "Authorization: Bearer $ADMIN" -F file=@policy.pdf
+curl -s localhost:8000/documents/jobs/<job id> -H "Authorization: Bearer $ADMIN"
 
 # Loyalty
-curl -s localhost:8000/customers/CUST1001/points
-curl -s localhost:8000/customers/CUST1001/redeem -H 'content-type: application/json' \
+api localhost:8000/customers/CUST1001/points
+api localhost:8000/customers/CUST1002/points   # 403: not this customer's account
+api localhost:8000/customers/CUST1001/redeem -H 'content-type: application/json' \
   -d '{"points": 500, "reference": "order-123"}'
 
 # Agent chat (needs an LLM key)
-curl -s localhost:8000/chat -H 'content-type: application/json' \
+api localhost:8000/chat -H 'content-type: application/json' \
   -d '{"customer_ref": "CUST1001", "message": "mere kitne points hai?"}'
 
 # Streaming (SSE): watch tokens and tool calls arrive
-curl -N localhost:8000/chat/stream -H 'content-type: application/json' \
+curl -N -H "Authorization: Bearer $CUST" localhost:8000/chat/stream -H 'content-type: application/json' \
   -d '{"customer_ref": "CUST1001", "message": "FD rate for senior citizens 1 year?"}'
 
 # Voice
-curl -s localhost:8000/voice/transcribe -F audio=@tests/fixtures/points_expiry_hi.wav
-curl -s localhost:8000/voice/chat -F customer_ref=CUST1001 -F audio=@tests/fixtures/points_question_en.wav
+api localhost:8000/voice/transcribe -F audio=@tests/fixtures/points_expiry_hi.wav
+api localhost:8000/voice/chat -F customer_ref=CUST1001 -F audio=@tests/fixtures/points_question_en.wav
 
 # Phase 1 keyword router, no LLM (kept as the eval baseline)
-curl -s localhost:8000/chat/baseline -H 'content-type: application/json' \
+api localhost:8000/chat/baseline -H 'content-type: application/json' \
   -d '{"customer_ref": "CUST1001", "message": "mere kitne points hai?"}'
 
 # Another tenant
-curl -s localhost:8000/search -H 'X-Tenant: second-bank' -H 'content-type: application/json' -d '{"query": "points expire"}'
+curl -s localhost:8000/search -H "Authorization: Bearer $SECOND" -H 'content-type: application/json' -d '{"query": "points expire"}'
 ```
 
 ## API
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| POST | `/documents` | Upload and ingest a file (deduplicated by SHA-256 per tenant) |
+| POST | `/documents` | Upload a file: 202 + job (admin; 200 if already ingested) |
+| GET | `/documents/jobs/{id}` | Ingestion job status and result (admin) |
 | GET | `/documents` | List the tenant's documents |
 | DELETE | `/documents/{id}` | Delete a document and its chunks |
 | POST | `/search` | Hybrid / vector / lexical search with per-retriever ranks (`lexical` = keyword + phonetic) |
 | GET | `/customers/{ref}/points` | Balance and points expiring in 30 days |
 | POST | `/customers/{ref}/redeem` | Idempotent redemption |
-| POST | `/chat` | Agent chat turn (JSON) |
+| POST | `/chat` | Agent chat turn (JSON); `cached` / `degraded` flags, `use_cache: false` to bypass |
 | POST | `/chat/stream` | Agent chat turn as Server-Sent Events |
 | GET / DELETE | `/chat/memory/{ref}` | View / clear a customer's conversation memory |
 | POST | `/chat/baseline` | Phase 1 keyword router (no LLM), the eval baseline |
 | POST | `/voice/transcribe` | Speech to text (Hindi / English) |
 | POST | `/voice/chat` | Speech to text, then an agent chat turn |
-| GET | `/health/live`, `/health/ready` | Liveness; readiness checks Postgres and Redis |
+| GET | `/health/live`, `/health/ready` | Liveness; readiness checks Postgres and Redis (RabbitMQ reported, not required) |
+
+All routes except `/health/*` need `Authorization: Bearer <JWT>` and are rate limited.
 
 ## Configuration
 
@@ -210,30 +313,34 @@ The `migrate` service runs `alembic upgrade head` on every `docker compose up`, 
 
 ```bash
 uv venv --python 3.12 && uv pip install -r requirements-dev.txt
-pytest tests   # unit tests (incl. agent loop with a fake LLM) always run; integration tests need
-               # the stack + seed, and the LLM ones also need an LLM key in the API container.
-               # On the Gemini free tier, run the LLM tests one at a time (5 requests/min).
+pytest tests   # unit tests (agent loop with a fake LLM, auth, circuit breaker, fallback chain,
+               # cache rules) always run; integration tests need the stack + seed and mint tokens
+               # with JWT_SECRET from .env. The LLM ones also need an LLM key in the API container.
+               # On the Gemini free tier, run the LLM tests one at a time (5 requests/min, 20/day).
 ```
 
 ## Layout
 
 ```
 app/
-  agent/        LLM providers (Claude, Gemini), agent loop, tools, prompts, chat-turn orchestration
+  agent/        LLM providers (Claude, Gemini) + fallback chain, agent loop, tools, prompts, chat turn
   api/          routers: chat (+stream, memory), chat_baseline, voice, documents, search, loyalty, health
   services/     text + language (detection, transliteration, phonetic keys), parsing, chunking,
-                embeddings, ingestion, search, loyalty, memory, speech
+                embeddings, ingestion, search, loyalty, memory, speech, baseline,
+                auth, ratelimit, resilience, semantic_cache, jobs
+  worker.py     RabbitMQ ingestion worker
   models.py     SQLAlchemy models        config.py   env settings        db.py   async engine
 alembic/        migrations
 data/seed/      fictional bank documents (English, Hinglish, Hindi) + tenants.json
-scripts/        seed.py (idempotent demo data), reindex_text.py (rebuild lexical/phonetic text)
+scripts/        seed.py (idempotent demo data), reindex_text.py (rebuild lexical/phonetic text),
+                issue_token.py (mint JWTs), calibrate_cache.py (semantic-cache threshold)
 ```
 
 ## Roadmap
 
 - [x] Phase 1: pgvector, hybrid search, ingestion, Docker Compose, Alembic, env config
 - [x] Phase 2: LLM tool calling, Redis conversation memory, transliteration, voice, SSE streaming
-- [ ] Phase 3: RabbitMQ ingestion workers, semantic cache, rate limits, circuit breaker, JWT auth
+- [x] Phase 3: RabbitMQ ingestion workers, semantic cache, rate limits, circuit breaker + LLM fallback, JWT auth
 - [ ] Phase 4: 100+ query eval set, LLM-as-judge CI gate, prompt-injection suite, audit log
 - [ ] Phase 5: Langfuse, Prometheus + Grafana, load tests, Kubernetes on AWS
 - [ ] Phase 6: demo, write-up

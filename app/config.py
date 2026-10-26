@@ -62,6 +62,44 @@ class Settings(BaseSettings):
     whisper_compute_type: str = "int8"
     max_audio_mb: int = 10
 
+    # --- Phase 3 ---
+
+    # JWT auth (HS256). The tenant comes from the token, never from a header the caller controls.
+    jwt_secret: str = ""  # required; at least 32 characters
+    jwt_issuer: str = "banking-loyalty-assistant"
+    jwt_audience: str = "assistant-api"
+    jwt_ttl_seconds: int = 3600
+
+    # Token-bucket rate limits in Redis, checked together: a request needs a token from both.
+    rate_limit_enabled: bool = True
+    rate_limit_user_per_minute: int = 30
+    rate_limit_user_burst: int = 10
+    rate_limit_tenant_per_minute: int = 600
+    rate_limit_tenant_burst: int = 100
+
+    # LLM fallback + circuit breaker. Fallback is optional; an empty provider disables it.
+    llm_fallback_provider: Literal["", "claude", "gemini"] = ""
+    llm_fallback_model: str = ""
+    llm_first_event_timeout_seconds: float = 25.0  # no first chunk by then: try the fallback
+    circuit_failure_threshold: int = 3  # consecutive failures before the circuit opens
+    circuit_reset_seconds: float = 30.0  # how long it stays open before a trial request
+    tool_timeout_seconds: float = 15.0  # read-only tools only; redemptions are never cut off
+    db_statement_timeout_ms: int = 15000
+    redis_socket_timeout_seconds: float = 5.0
+
+    # Semantic answer cache (Redis Query Engine vector index)
+    semantic_cache_enabled: bool = True
+    semantic_cache_threshold: float = 0.965  # cosine similarity; see scripts/calibrate_cache.py
+    semantic_cache_ttl_seconds: int = 24 * 3600
+
+    # Background jobs (RabbitMQ). The jobs table is the source of truth; messages carry only ids.
+    rabbitmq_url: str = "amqp://guest:guest@localhost:5672/"
+    job_max_attempts: int = 3
+    job_retry_delay_seconds: int = 10
+    job_sweep_interval_seconds: int = 60
+    job_stale_seconds: int = 120  # a queued job untouched this long is re-published by the sweeper
+    worker_prefetch: int = 1  # embedding is CPU-bound: one job at a time per worker, scale with replicas
+
 
 @lru_cache
 def get_settings() -> Settings:

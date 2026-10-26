@@ -15,8 +15,9 @@ services:
       timeout: 3s
       retries: 20
 
+  # Redis 8 ships the Query Engine (vector search) used by the semantic cache.
   redis:
-    image: redis:7.4-alpine
+    image: redis:8.2
     command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     ports:
       - "${REDIS_PORT:-6379}:6379"
@@ -27,6 +28,19 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"  # management UI, guest/guest
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
 
   # One-shot job: apply migrations, then exit. The API waits for it to succeed.
   migrate:
@@ -45,6 +59,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-assistant}:${POSTGRES_PASSWORD:-assistant}@postgres:5432/${POSTGRES_DB:-assistant}
       REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:
@@ -52,6 +67,9 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+      # Not required to serve: uploads queue in Postgres until the broker is reachable.
+      rabbitmq:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
       interval: 10s
@@ -59,6 +77,25 @@ services:
       start_period: 60s
       retries: 5
 
+  # Ingestion worker. Scale with: docker compose up -d --scale worker=3
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-assistant}:${POSTGRES_PASSWORD:-assistant}@postgres:5432/${POSTGRES_DB:-assistant}
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      VOICE_ENABLED: "false"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
 volumes:
   pgdata:
   redisdata:
+  rabbitmqdata:

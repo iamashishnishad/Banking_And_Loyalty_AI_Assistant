@@ -17,6 +17,8 @@ def get_engine() -> AsyncEngine:
             pool_size=settings.db_pool_size,
             max_overflow=settings.db_max_overflow,
             pool_pre_ping=True,
+            # A runaway query fails fast instead of holding a pooled connection.
+            connect_args={"server_settings": {"statement_timeout": str(settings.db_statement_timeout_ms)}},
         )
         _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
     return _engine

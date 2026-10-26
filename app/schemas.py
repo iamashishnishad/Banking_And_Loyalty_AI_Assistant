@@ -16,9 +16,25 @@ class DocumentOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class IngestOut(BaseModel):
-    document: DocumentOut
-    created: bool
+class JobOut(BaseModel):
+    id: uuid.UUID
+    kind: str
+    status: Literal["queued", "running", "succeeded", "failed"]
+    attempts: int
+    error: str | None
+    result: dict | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class UploadOut(BaseModel):
+    """202 + job while queued; 200 + the existing document when the same file was already ingested."""
+
+    status: Literal["queued", "duplicate"]
+    job: JobOut | None = None
+    document: DocumentOut | None = None
 
 
 class SearchIn(BaseModel):
@@ -69,6 +85,7 @@ class RedeemOut(BaseModel):
 class ChatIn(BaseModel):
     customer_ref: str = Field(min_length=1, max_length=100)
     message: str = Field(min_length=1, max_length=2000)
+    use_cache: bool = Field(default=True, description="false forces a fresh agent answer (evals, 'regenerate')")
 
 
 class BaselineChatOut(BaseModel):
@@ -99,6 +116,9 @@ class ChatOut(BaseModel):
     sources: list[SourceOut]
     usage: dict[str, int]
     took_ms: float
+    cached: bool = False  # answered from the semantic cache, no LLM call
+    cache_similarity: float | None = None
+    degraded: bool = False  # every LLM was down; answered by the no-LLM baseline
 
 
 class MemoryOut(BaseModel):

@@ -7,7 +7,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 
 from app.agent.llm import get_llm
 from app.api.chat import ensure_customer, run_chat
-from app.api.deps import RedisDep, SessionDep, TenantDep
+from app.api.deps import PrincipalDep, RedisDep, SessionDep, TenantDep, authorize_customer
 from app.config import get_settings
 from app.schemas import TranscriptOut, VoiceChatOut
 from app.services.speech import Transcript, transcribe
@@ -46,9 +46,11 @@ async def voice_chat(
     session: SessionDep,
     tenant_id: TenantDep,
     redis: RedisDep,
+    principal: PrincipalDep,
     customer_ref: str = Form(...),
     audio: UploadFile = File(...),
 ) -> VoiceChatOut:
+    authorize_customer(principal, customer_ref)
     await ensure_customer(session, tenant_id, customer_ref)
     get_llm()  # fail fast on a missing key before spending seconds on transcription
     transcript = await _transcribe_upload(audio)

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, Request, Response, status
 from sqlalchemy import text
 
 from app.api.deps import RedisDep, SessionDep
@@ -12,7 +12,7 @@ async def live() -> dict:
 
 
 @router.get("/health/ready")
-async def ready(session: SessionDep, redis: RedisDep, response: Response) -> dict:
+async def ready(request: Request, session: SessionDep, redis: RedisDep, response: Response) -> dict:
     checks = {}
     try:
         await session.execute(text("SELECT 1"))
@@ -27,4 +27,6 @@ async def ready(session: SessionDep, redis: RedisDep, response: Response) -> dic
     ok = all(v == "ok" for v in checks.values())
     if not ok:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-    return {"status": "ok" if ok else "degraded", "checks": checks}
+    # Reported but not required: uploads are queued in Postgres while RabbitMQ is down.
+    rabbitmq = "ok" if await request.app.state.job_publisher.ping() else "unreachable"
+    return {"status": "ok" if ok else "degraded", "checks": checks, "optional": {"rabbitmq": rabbitmq}}
