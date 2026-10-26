@@ -320,3 +320,84 @@ def test_search_reply_parsed_in_both_client_formats():
     as_array = [1, b"semcache:a", [b"dist", b"0.01", b"payload", b"{}"]]
     assert _search_rows(as_map) == _search_rows(as_array) == [{"dist": b"0.01", "payload": b"{}"}]
     assert _search_rows({b"total_results": 0, b"results": []}) == _search_rows([0]) == []
+
+
+# --- OpenAI-compatible adapter (Azure OpenAI) -------------------------------------------------
+
+
+def _chunk(content=None, tool_calls=None, finish=None, usage=None):
+    choices = [] if usage else [SimpleNamespace(finish_reason=finish, delta=SimpleNamespace(content=content, tool_calls=tool_calls))]
+    return SimpleNamespace(choices=choices, usage=usage)
+
+
+def _tc(index, id_=None, name=None, args=None):
+    return SimpleNamespace(index=index, id=id_, function=SimpleNamespace(name=name, arguments=args))
+
+
+class FakeOpenAIClient:
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.kwargs = None
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _create(self, **kwargs):
+        self.kwargs = kwargs
+
+        async def gen():
+            for c in self.chunks:
+                yield c
+
+        return gen()
+
+
+def _openai_events(chunks, messages=None):
+    from app.agent.llm import OpenAILLM
+
+    client = FakeOpenAIClient(chunks)
+    llm = OpenAILLM(client, "my-deployment", 1000)
+
+    async def go():
+        return [e async for e in llm.stream(system="sys", messages=messages or [{"role": "user", "content": "hi"}], tools=[])]
+
+    return asyncio.run(go()), client
+
+
+def test_openai_stream_assembles_fragmented_tool_call():
+    usage = SimpleNamespace(prompt_tokens=120, completion_tokens=15, prompt_tokens_details=SimpleNamespace(cached_tokens=64))
+    events, client = _openai_events(
+        [
+            _chunk(content="Let me check."),
+            _chunk(tool_calls=[_tc(0, "call_1", "search_knowledge_base", '{"que')]),
+            _chunk(tool_calls=[_tc(0, None, None, 'ry": "fd rates"}')], finish="tool_calls"),
+            _chunk(usage=usage),
+        ]
+    )
+    assert events[0] == TextDelta("Let me check.")
+    final = events[-1].message
+    assert final.stop_reason == "tool_use"
+    assert [b.type for b in final.content] == ["text", "tool_use"]
+    assert final.content[1].input == {"query": "fd rates"} and final.content[1].id == "call_1"
+    assert final.usage.input_tokens == 120 and final.usage.cache_read_input_tokens == 64
+    assert client.kwargs["model"] == "my-deployment" and client.kwargs["messages"][0] == {"role": "system", "content": "sys"}
+
+
+def test_openai_unparseable_arguments_raise_value_error_for_retry():
+    with pytest.raises(ValueError):
+        _openai_events([_chunk(tool_calls=[_tc(0, "c", "start_redemption", '{"points": ')], finish="tool_calls")])
+
+
+def test_openai_history_conversion():
+    from app.agent.llm import OpenAILLM
+
+    out = OpenAILLM._messages(
+        "sys",
+        [
+            {"role": "user", "content": "fd?"},
+            {"role": "system", "content": "Bank: Demo"},
+            {"role": "assistant", "content": [SimpleNamespace(type="tool_use", id="t1", name="search_knowledge_base", input={"query": "fd"})]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "none", "is_error": True}]},
+        ],
+    )
+    assert out[2] == {"role": "system", "content": "Bank: Demo"}
+    assert out[3]["content"] is None and out[3]["tool_calls"][0]["function"] == {"name": "search_knowledge_base", "arguments": '{"query": "fd"}'}
+    assert out[4] == {"role": "tool", "tool_call_id": "t1", "content": "ERROR: none"}

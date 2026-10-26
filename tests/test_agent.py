@@ -181,3 +181,33 @@ def test_confirm_requires_a_later_customer_turn(monkeypatch, turn, should_redeem
 def test_invalid_tool_input_rejected():
     content, is_error = asyncio.run(tools.run_tool(_ctx(), "start_redemption", {"points": "lots"}))
     assert is_error and "INVALID_INPUT" in content
+
+
+class FakePendingMemory(FakeMemory):
+    async def set_pending_redemption(self, pending):
+        self.pending = pending
+
+
+def _start(monkeypatch, pending, turn, points=500, redemption_type="travel"):
+    async def fake_balance(session, tenant_id, customer_ref):
+        return SimpleNamespace(points=5000)
+
+    monkeypatch.setattr(tools, "get_balance", fake_balance)
+    memory = FakePendingMemory(pending)
+    ctx = ToolContext(session=None, redis=None, tenant_id=uuid.uuid4(), customer_ref="C1", memory=memory, turn=turn)
+    content, is_error = asyncio.run(
+        tools.run_tool(ctx, "start_redemption", {"points": points, "redemption_type": redemption_type})
+    )
+    return content, memory.pending
+
+
+def test_restarting_the_same_redemption_on_yes_keeps_the_original(monkeypatch):
+    original = PendingRedemption(id="rdm-1", points=500, redemption_type="travel", created_turn=3)
+    content, pending = _start(monkeypatch, original, turn=4)
+    assert "already_pending" in content and pending is original  # confirm in turn 4 still allowed
+
+
+def test_a_different_redemption_replaces_the_pending_one(monkeypatch):
+    original = PendingRedemption(id="rdm-1", points=500, redemption_type="travel", created_turn=3)
+    content, pending = _start(monkeypatch, original, turn=4, points=800)
+    assert "awaiting_customer_confirmation" in content and pending.points == 800 and pending.created_turn == 4
